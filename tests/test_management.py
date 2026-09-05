@@ -25,7 +25,7 @@ class ManagementTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory(prefix="delegate-lifecycle-")
         self.addCleanup(self.temporary.cleanup)
-        self.root = Path(self.temporary.name)
+        self.root = Path(self.temporary.name).resolve()
         self.source = self.root / "source"
         self.source_skill = self.source / "skills/delegate-workers"
         shutil.copytree(ROOT / "skills/delegate-workers", self.source_skill,
