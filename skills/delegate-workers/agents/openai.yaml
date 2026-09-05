@@ -1,0 +1,3 @@
+interface:
+  display_name: "Delegate Workers"
+  short_description: "Configure worker models while keeping your main session"

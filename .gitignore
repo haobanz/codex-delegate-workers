@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+tmp/
+.delegate-workers-install.json
+workers.json.bak
