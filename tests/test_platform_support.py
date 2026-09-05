@@ -84,6 +84,19 @@ class PlatformTests(unittest.TestCase):
             platform.write_user_path(before)
         self.assertEqual(platform.read_user_path(), before)
 
+    @unittest.skipUnless(os.name == "nt", "Windows CMD runtime")
+    def test_native_batch_can_be_deleted_by_its_child(self):
+        with tempfile.TemporaryDirectory(prefix="delegate self removal ") as directory:
+            root = Path(directory)
+            command = root / "dw.cmd"
+            script = root / "manager.py"
+            script.write_text(f"from pathlib import Path\nPath({str(command)!r}).unlink()\n", encoding="utf-8")
+            (root / "delegate-workers-entry.py").write_bytes(platform.windows_python_launcher(script, root))
+            command.write_bytes(platform.windows_batch_launcher())
+            result = subprocess.run([str(command)], capture_output=True, text=True, encoding="utf-8")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(command.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

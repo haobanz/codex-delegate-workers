@@ -54,18 +54,18 @@ def default_bin():
     return Path.home() / ".local/bin"
 
 
-def windows_batch_launcher():
+def windows_batch_launcher(*, legacy=False):
+    # Parse the exit with the dispatch so uninstall can remove the batch file.
+    ending = "\r\nexit /b %errorlevel%\r\n" if legacy else " & exit /b\r\n"
     return (
         "@echo off\r\n"
         "rem Managed by Delegate Workers\r\n"
         "setlocal DisableDelayedExpansion\r\n"
         'py -3 -c "import sys; sys.exit(sys.version_info < (3, 10))" >nul 2>&1\r\n'
         "if errorlevel 1 goto python\r\n"
-        'py -3 -X utf8 "%~dp0delegate-workers-entry.py" %*\r\n'
-        "exit /b %errorlevel%\r\n"
+        'py -3 -X utf8 "%~dp0delegate-workers-entry.py" %*' + ending +
         ":python\r\n"
-        'python -X utf8 "%~dp0delegate-workers-entry.py" %*\r\n'
-        "exit /b %errorlevel%\r\n"
+        'python -X utf8 "%~dp0delegate-workers-entry.py" %*' + ending
     ).encode("ascii")
 
 

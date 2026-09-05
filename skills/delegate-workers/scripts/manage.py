@@ -191,8 +191,13 @@ class Installation:
         for launcher in self.launchers():
             if launcher.is_symlink():
                 raise ManagementError(f"命令入口是符号链接，未进行覆盖：{launcher}")
-            if launcher.exists() and launcher.read_bytes() != self.launcher_content(launcher):
-                raise ManagementError(f"命令入口被修改过或存在同名程序，未进行覆盖：{launcher}")
+            if launcher.exists():
+                content = launcher.read_bytes()
+                known = [self.launcher_content(launcher)]
+                if platform_support.WINDOWS and launcher.suffix == ".cmd":
+                    known.append(platform_support.windows_batch_launcher(legacy=True))
+                if content not in known:
+                    raise ManagementError(f"命令入口被修改过或存在同名程序，未进行覆盖：{launcher}")
 
     def write_launchers(self):
         for launcher in self.launchers():
