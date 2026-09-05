@@ -39,19 +39,19 @@ curl -fsSL https://raw.githubusercontent.com/haobanz/codex-delegate-workers/main
 
 1. 在 Codex 界面选择你希望使用的主代理模型和思考强度，本项目不会覆盖它。
 2. 执行一键安装命令，再打开菜单。
-3. 选择 **2. Worker model settings**，选择 `default`，输入执行模型 ID 和思考强度。直接回车可保留当前值。
-4. `Fallback profile` 填 `complex`，表示允许考虑该执行角色进行失败升级；填 `none` 可关闭这个角色的升级路径。
-5. 再次选择 **2** 可以设置 `complex`，也可以输入新的角色名称。`Set as the default worker` 可选择是否将该角色设为默认执行角色。
-6. 选择 **3. Concurrency / attempts** 设置最多并行子代理数和单个任务最多尝试次数。
-7. 选择 **4. Status / validate** 查看配置、版本和本地代码修改状态。
+3. 选择 **2. 设置执行模型和思考强度**，常规执行角色为 `default`，输入执行模型 ID，再按数字选择中文标注的思考强度。直接回车可保留当前值。
+4. “后备角色名称”填 `complex`，表示允许考虑该执行角色进行失败升级；填“无”可关闭这个角色的升级路径。
+5. 再次选择 **2** 可以设置困难任务角色 `complex`，也可以输入新的英文角色名称。提示“设为默认执行角色？”时输入“是”或“否”。
+6. 选择 **3. 设置并发数和尝试次数** 设置最多并行子代理数和单个任务最多尝试次数。
+7. 选择 **4. 查看状态和当前设置** 查看中文配置摘要、版本和本地代码修改状态。
 8. 在 Codex 中新建任务，输入 `$delegate-workers` 和具体需求。若技能列表仍未刷新，重启 Codex。
 
 默认配置：
 
 | 执行角色 | 模型 | 思考强度 | 后备角色 |
 | --- | --- | --- | --- |
-| `default` | `gpt-5.6-luna` | `medium` | `complex` |
-| `complex` | `gpt-5.6-terra` | `high` | 无 |
+| 常规执行 `default` | `gpt-5.6-luna` | 中 `medium` | `complex` |
+| 困难任务 `complex` | `gpt-5.6-terra` | 高 `high` | 无 |
 
 默认最多并行 3 个执行子代理，每个任务最多尝试 2 次。实际模型可用性、思考档位和并发容量以当前 Codex 环境为准。
 
@@ -84,13 +84,13 @@ dw update
 curl -fsSL https://raw.githubusercontent.com/haobanz/codex-delegate-workers/main/install.sh | bash -s -- update
 ```
 
-菜单中的 **1. Install / update** 也会执行安装或更新。更新菜单完成后会退出，重新打开即可加载新版管理工具；新建 Codex 任务可加载更新后的 Skill 指令。
+菜单中的 **1. 安装 / 更新** 也会执行安装或更新。更新菜单完成后会退出，重新打开即可加载新版管理工具；新建 Codex 任务可加载更新后的 Skill 指令。
 
 - 更新保留你自己的执行模型配置 `workers.json`。
 - 更新前备份旧版本，先验证新代码能读取现有设置，再替换安装目录。
 - 网络失败、配置不兼容或替换失败时，保留或恢复旧版本。
 - 如果你修改了安装目录里的 Skill 代码，更新会报告冲突，不覆盖这些修改。
-- **5. Roll back code** 回滚代码并保留当前执行设置；如果旧代码无法读取当前设置，会停止回滚。
+- **5. 回滚版本（保留执行设置）** 回滚代码并保留当前执行设置；如果旧代码无法读取当前设置，会停止回滚。
 
 ## 非交互设置
 
@@ -121,6 +121,8 @@ dw status
 dw rollback
 dw uninstall --yes
 ```
+
+菜单和终端中的状态输出为中文；重定向或管道中的结果仍保留原有 JSON 字段，方便脚本读取。
 
 卸载仅移除本项目的 Skill 和启动器，并保留可恢复的备份。不会删除其他 Skill、项目文件或 Codex 主代理配置。
 

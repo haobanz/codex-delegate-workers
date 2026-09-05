@@ -234,7 +234,26 @@ class ManagementTests(unittest.TestCase):
                 patch.object(replies, "isatty", return_value=True), \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             self.assertEqual(manage.main(["--codex-home", str(self.home)]), 0)
-        self.assertIn("Worker model settings", output.getvalue())
+        self.assertIn("设置执行模型和思考强度", output.getvalue())
+
+    def test_menu_accepts_chinese_and_numeric_effort_choices(self):
+        self.install()
+        for choice in ("高", "3"):
+            with self.subTest(choice=choice):
+                replies = io.StringIO(f"2\ncustom\ncustom-model\n{choice}\n无\n是\n0\n")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    manage.menu(self.installation, self.source, replies)
+                config = self.installation.config()
+                self.assertEqual(config["default_profile"], "custom")
+                self.assertEqual(config["profiles"]["custom"]["reasoning_effort"], "high")
+                self.assertIsNone(config["profiles"]["custom"]["fallback"])
+
+    def test_menu_accepts_chinese_uninstall_confirmation(self):
+        self.install()
+        with contextlib.redirect_stdout(io.StringIO()):
+            manage.menu(self.installation, self.source, io.StringIO("6\n卸载\n"))
+        self.assertFalse(self.installation.skill.exists())
+        self.assertTrue(any(self.installation.backups.iterdir()))
 
     def test_custom_command_directory_survives_subsequent_launch(self):
         commands = self.root / "user bin"

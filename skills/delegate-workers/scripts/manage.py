@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install, update, and configure Delegate Workers without changing Codex settings."""
+"""安装、更新和设置执行子代理，保留当前 Codex 主代理设置。"""
 
 import argparse
 import contextlib
@@ -24,6 +24,8 @@ PROJECT = "delegate-workers"
 REPOSITORY = "https://github.com/haobanz/codex-delegate-workers.git"
 RECEIPT = ".delegate-workers-install.json"
 REQUIRED = {"SKILL.md", "workers.json", "VERSION", "scripts/workers.py", "scripts/manage.py"}
+EFFORT_LABELS = {"low": "低", "medium": "中", "high": "高", "xhigh": "超高",
+                 "max": "最大", "ultra": "极限", "minimal": "最低", "none": "关闭"}
 
 
 class ManagementError(ValueError):
@@ -57,7 +59,7 @@ def inventory(directory):
     result = {}
     for path in directory.rglob("*"):
         if path.is_symlink():
-            raise ManagementError(f"Symbolic links are not managed: {path}")
+            raise ManagementError(f"无法管理符号链接，请先检查此路径：{path}")
         relative = path.relative_to(directory)
         if "__pycache__" in relative.parts or path.suffix in {".pyc", ".pyo"}:
             continue
@@ -68,26 +70,26 @@ def inventory(directory):
 
 def load_receipt(directory):
     if directory.is_symlink():
-        raise ManagementError(f"Refusing to replace a symlinked skill: {directory}")
+        raise ManagementError(f"技能目录是符号链接，未进行替换：{directory}")
     if not directory.exists():
         return None
     receipt_path = directory / RECEIPT
     if not receipt_path.is_file() or receipt_path.is_symlink():
-        raise ManagementError(f"Existing directory is not a managed installation: {directory}")
+        raise ManagementError(f"目录已存在，但不是本工具安装的版本，未进行覆盖：{directory}")
     value = workers.read_json(receipt_path)
     if (not isinstance(value, dict) or value.get("project") != PROJECT
             or value.get("schema_version") != 1 or not isinstance(value.get("files"), dict)):
-        raise ManagementError(f"Invalid installation receipt: {receipt_path}")
+        raise ManagementError(f"安装记录格式无效：{receipt_path}")
     if any(not isinstance(value.get(key), str) or not value[key] for key in ("version", "revision")):
-        raise ManagementError(f"Invalid version or revision in receipt: {receipt_path}")
+        raise ManagementError(f"安装记录中的版本或提交编号无效：{receipt_path}")
     if "command_dir" in value and (not isinstance(value["command_dir"], str)
                                    or not Path(value["command_dir"]).is_absolute()):
-        raise ManagementError(f"Invalid command directory in receipt: {receipt_path}")
+        raise ManagementError(f"安装记录中的命令目录无效：{receipt_path}")
     for relative, digest in value["files"].items():
         path = PurePosixPath(relative)
         if (not relative or path.is_absolute() or ".." in path.parts or "\\" in relative
                 or relative in {RECEIPT, "workers.json"} or not isinstance(digest, str)):
-            raise ManagementError(f"Invalid managed path in receipt: {relative}")
+            raise ManagementError(f"安装记录中的文件路径无效：{relative}")
     return value
 
 
@@ -103,7 +105,7 @@ class Installation:
         default_bin = Path.home() / ".local/bin" if self.home == user_codex else self.home / "bin"
         self.command_dir = Path(bin_dir or saved_bin or default_bin).expanduser().resolve()
         if saved_bin and self.command_dir != Path(saved_bin):
-            raise ManagementError("This installation already has a command directory; uninstall before changing it")
+            raise ManagementError("已安装版本的命令目录不能直接更改，请先卸载再选择新目录")
 
     def launchers(self):
         return list(dict.fromkeys((self.launcher, self.command_dir / "dw", self.command_dir / PROJECT)))
@@ -115,11 +117,11 @@ class Installation:
         return shlex.quote(str(self.command_dir / "dw"))
 
     def print_commands(self):
-        print(f"\nMenu: {self.menu_command()}")
-        print(f"Update: {self.menu_command()} update")
+        print(f"\n打开菜单：{self.menu_command()}")
+        print(f"一键更新：{self.menu_command()} update")
         path_dirs = [Path(part).expanduser().resolve() for part in os.get_exec_path() if part]
         if self.command_dir not in path_dirs:
-            print("Add the command directory to PATH once in your shell configuration:")
+            print("请在 Shell 配置中添加下面一行，让终端能找到短命令：")
             print(f'export PATH={shlex.quote(str(self.command_dir))}:"$PATH"')
 
     @contextlib.contextmanager
@@ -129,7 +131,7 @@ class Installation:
             try:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
-                raise ManagementError("Another Delegate Workers operation is running") from exc
+                raise ManagementError("另一个安装或设置操作正在运行，请稍后重试") from exc
             try:
                 yield
             finally:
@@ -143,9 +145,9 @@ class Installation:
     def check_launcher(self):
         for launcher in self.launchers():
             if launcher.is_symlink():
-                raise ManagementError(f"Launcher is a symlink: {launcher}")
+                raise ManagementError(f"命令入口是符号链接，未进行覆盖：{launcher}")
             if launcher.exists() and launcher.read_bytes() != self.launcher_content():
-                raise ManagementError(f"Launcher contains unmanaged changes: {launcher}")
+                raise ManagementError(f"命令入口被修改过或存在同名程序，未进行覆盖：{launcher}")
 
     def write_launchers(self):
         for launcher in self.launchers():
@@ -160,7 +162,7 @@ class Installation:
 
     def config(self):
         if load_receipt(self.skill) is None:
-            raise ManagementError("Install Delegate Workers first")
+            raise ManagementError("请先选择菜单 1 安装本技能")
         return workers.validate_config(workers.read_json(self.skill / "workers.json"))
 
     def changed_files(self, receipt):
@@ -179,25 +181,25 @@ class Installation:
         files = present if source_files is None else source_files
         for relative in REQUIRED:
             if not (source / relative).is_file():
-                raise ManagementError(f"Release is missing {relative}")
+                raise ManagementError(f"新版本缺少必要文件：{relative}")
         if not (REQUIRED - {"workers.json"}) <= files.keys():
-            raise ManagementError("Release manifest is missing required files")
+            raise ManagementError("版本文件清单缺少必要文件")
         for relative, digest in files.items():
             if present.get(relative) != digest:
-                raise ManagementError(f"Release file has changed: {relative}")
+                raise ManagementError(f"版本文件校验失败：{relative}")
         version = (source / "VERSION").read_text(encoding="utf-8").strip()
         if not version or len(version) > 64:
-            raise ManagementError("Invalid release version")
+            raise ManagementError("版本号无效")
         old = load_receipt(self.skill)
         self.check_launcher()
         if old:
             changes = self.changed_files(old)
             if changes:
-                raise ManagementError("Installed code has local changes; preserve them before updating: "
+                raise ManagementError("已安装代码存在本地修改，请先保存这些修改再更新："
                                       + ", ".join(changes))
             for relative in files.keys() - old["files"].keys():
                 if (self.skill / relative).exists():
-                    raise ManagementError(f"New release conflicts with an unmanaged file: {relative}")
+                    raise ManagementError(f"新版本与个人文件冲突，未进行覆盖：{relative}")
         self.skill.parent.mkdir(parents=True, exist_ok=True)
         stage = Path(tempfile.mkdtemp(prefix=".delegate-workers-stage-", dir=self.skill.parent))
         backup = None
@@ -218,7 +220,7 @@ class Installation:
                 [sys.executable, str(stage / "scripts/workers.py"), "validate"],
                 capture_output=True, text=True, check=False, timeout=30)
             if validation.returncode:
-                raise ManagementError("Candidate rejected the worker settings: " + validation.stderr.strip())
+                raise ManagementError("新版本无法读取当前执行配置，已停止更新：" + validation.stderr.strip())
             receipt = {"schema_version": 1, "project": PROJECT, "repository": REPOSITORY,
                        "version": version, "revision": revision, "files": files,
                        "command_dir": str(self.command_dir)}
@@ -248,7 +250,7 @@ class Installation:
     def install(self, source=None, require_existing=False):
         with self.locked():
             if require_existing and load_receipt(self.skill) is None:
-                raise ManagementError("Install Delegate Workers before updating")
+                raise ManagementError("尚未安装，请先选择菜单 1 安装本技能")
             if source is not None:
                 root = Path(source).expanduser().resolve()
                 return self.apply(root / "skills" / PROJECT, revision_of(root))
@@ -271,7 +273,7 @@ class Installation:
             candidate = dict(current)
             if model is not None:
                 if effort is None:
-                    raise ManagementError("Changing a model requires an explicit --effort")
+                    raise ManagementError("更改模型时必须同时指定思考强度（--effort）")
                 candidate["model"] = model
             if effort is not None:
                 candidate["reasoning_effort"] = effort
@@ -308,7 +310,7 @@ class Installation:
             backups = sorted(self.backups.glob("*"), reverse=True)
             previous = next((path for path in backups if path.is_dir() and (path / RECEIPT).is_file()), None)
             if previous is None:
-                raise ManagementError("No installation backup is available")
+                raise ManagementError("没有可用于回滚的安装备份")
             receipt = load_receipt(previous)
             return self.apply(previous, receipt["revision"], receipt["files"])
 
@@ -335,9 +337,9 @@ def run_git(arguments):
     try:
         result = subprocess.run(["git", *arguments], capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ManagementError(f"Git failed: {exc}") from exc
+        raise ManagementError(f"Git 操作失败，请检查网络和 Git 是否可用：{exc}") from exc
     if result.returncode:
-        raise ManagementError(result.stderr.strip() or "Git operation failed")
+        raise ManagementError("Git 操作失败：" + (result.stderr.strip() or "请检查网络和仓库访问权限"))
     return result.stdout.strip()
 
 
@@ -349,12 +351,71 @@ def revision_of(root):
     if result.returncode == 1:
         return "local"
     if result.returncode:
-        raise ManagementError(result.stderr.strip() or "Cannot inspect source revision")
+        raise ManagementError("无法读取源码提交编号：" + result.stderr.strip())
     return result.stdout.strip()
 
 
-def print_result(value):
-    print(json.dumps(value, indent=2, ensure_ascii=False))
+def profile_label(name):
+    return {"default": "常规执行（default）", "complex": "困难任务（complex）"}.get(name, name)
+
+
+def print_config(config):
+    print(f"默认执行角色：{profile_label(config['default_profile'])}")
+    print(f"最多并行子代理数：{config['max_parallel_workers']}")
+    print(f"每个任务最多尝试次数：{config['max_attempts_per_task']}")
+    for name, profile in config["profiles"].items():
+        effort = profile["reasoning_effort"]
+        print(f"\n  {profile_label(name)}")
+        print(f"    模型：{profile['model']}")
+        print(f"    思考强度：{EFFORT_LABELS.get(effort, effort)}（{effort}）")
+        print(f"    后备角色：{profile_label(profile['fallback']) if profile.get('fallback') else '无'}")
+
+
+def print_result(value, *, human=False):
+    if not human:
+        print(json.dumps(value, indent=2, ensure_ascii=False))
+        return
+    if "installed" in value:
+        print(f"\n安装状态：{'已安装' if value['installed'] else '未安装'}")
+        print(f"技能目录：{value['skill']}")
+        if not value["installed"]:
+            return
+        print(f"当前版本：{value['version']}")
+        print(f"提交编号：{value['revision']}")
+        changes = value["local_code_changes"]
+        print(f"代码检查：{'存在本地修改：' + ', '.join(changes) if changes else '正常'}")
+        print_config(value["config"])
+        print("\n主代理模型和思考强度：沿用当前 Codex 会话设置")
+    elif "profiles" in value:
+        print_config(value)
+        print("\n执行配置已保存。")
+    elif "result" in value:
+        labels = {"installed": "安装完成", "updated": "版本已更新", "unchanged": "已是当前版本",
+                  "uninstalled": "已卸载，备份已保留", "not_installed": "尚未安装"}
+        print(labels.get(value["result"], value["result"]))
+        if value.get("version"):
+            print(f"版本：{value['version']}")
+        if value.get("backup"):
+            print(f"备份位置：{value['backup']}")
+
+
+def select_effort(stream, current):
+    options = list(EFFORT_LABELS)
+    print("思考强度：")
+    for index, effort in enumerate(options, 1):
+        print(f"  {index}. {EFFORT_LABELS[effort]}（{effort}）")
+    default = str(options.index(current) + 1)
+    choice = prompt(stream, "选择强度编号，也可输入中文或英文档位", default)
+    if choice in {str(index) for index in range(1, len(options) + 1)}:
+        return options[int(choice) - 1]
+    return {label: effort for effort, label in EFFORT_LABELS.items()}.get(choice, choice)
+
+
+def prompt_count(stream, label, default):
+    try:
+        return int(prompt(stream, label, default))
+    except ValueError as exc:
+        raise ManagementError(f"{label}必须填写整数") from exc
 
 
 def prompt(stream, label, default=None):
@@ -374,63 +435,64 @@ def menu(installation, source=None, stream=None):
         except OSError as exc:
             if sys.stdin.isatty():
                 return menu(installation, source, sys.stdin)
-            raise ManagementError("The menu needs a terminal; use install, update, configure, or status in scripts") from exc
+            raise ManagementError("菜单需要交互式终端；脚本中请使用 install、update、configure 或 status 命令") from exc
     while True:
-        print("\nDelegate Workers\n"
-              "1. Install / update\n2. Worker model settings\n3. Concurrency / attempts\n"
-              "4. Status / validate\n5. Roll back code (keep worker settings)\n6. Uninstall\n0. Exit")
+        print("\n执行子代理管理\n"
+              "1. 安装 / 更新\n2. 设置执行模型和思考强度\n3. 设置并发数和尝试次数\n"
+              "4. 查看状态和当前设置\n5. 回滚版本（保留执行设置）\n6. 卸载\n0. 退出")
         try:
-            choice = prompt(stream, "Select", "0")
+            choice = prompt(stream, "请选择", "0")
             if choice == "0":
                 return
             if choice == "1":
-                print_result(installation.install(source))
-                print("Open a new Codex task to load changed skill instructions.")
+                print_result(installation.install(source), human=True)
+                print("请新建 Codex 任务以加载更新后的技能。")
                 installation.print_commands()
                 return
             elif choice == "2":
                 config = installation.config()
                 for name, profile in config["profiles"].items():
-                    print(f"  {name}: {profile['model']} / {profile['reasoning_effort']}")
-                name = prompt(stream, "Profile name (existing or new)", config["default_profile"])
+                    print(f"  {profile_label(name)}：{profile['model']} / {EFFORT_LABELS[profile['reasoning_effort']]}")
+                name = prompt(stream, "执行角色名称（可输入已有名称或新名称）", config["default_profile"])
                 current = config["profiles"].get(name, {})
-                model = prompt(stream, "Worker model ID", current.get("model"))
-                effort = prompt(stream, "Reasoning (low/medium/high/xhigh/max; depends on the model)",
-                                current.get("reasoning_effort", "medium"))
-                fallback = prompt(stream, "Fallback profile or none", current.get("fallback") or "none")
-                default = prompt(stream, "Set as the default worker? y/N", "n").lower() == "y"
+                model = prompt(stream, "执行模型 ID", current.get("model"))
+                effort = select_effort(stream, current.get("reasoning_effort", "medium"))
+                fallback = prompt(stream, "后备角色名称（输入“无”关闭升级）", current.get("fallback") or "无")
+                if fallback == "无":
+                    fallback = "none"
+                default = prompt(stream, "设为默认执行角色？是/否", "否").lower() in {"是", "y", "yes"}
                 installation.configure(name, model, effort, fallback, default)
-                print("Worker settings saved. Main session settings are unchanged.")
+                print("执行配置已保存，主代理设置未改变。")
             elif choice == "3":
                 config = installation.config()
-                parallel = int(prompt(stream, "Maximum parallel workers", config["max_parallel_workers"]))
-                attempts = int(prompt(stream, "Maximum attempts per task", config["max_attempts_per_task"]))
+                parallel = prompt_count(stream, "最多并行子代理数", config["max_parallel_workers"])
+                attempts = prompt_count(stream, "每个任务最多尝试次数", config["max_attempts_per_task"])
                 installation.set_limits(parallel, attempts)
-                print("Limits saved.")
+                print("并发数和尝试次数已保存。")
             elif choice == "4":
-                print_result(installation.status())
+                print_result(installation.status(), human=True)
             elif choice == "5":
-                print_result(installation.rollback())
-                print("Open a new Codex task to reload skill instructions.")
+                print_result(installation.rollback(), human=True)
+                print("请新建 Codex 任务以重新加载技能。")
                 return
             elif choice == "6":
-                if prompt(stream, "Type uninstall to remove this skill") == "uninstall":
-                    print_result(installation.uninstall())
+                if prompt(stream, "输入“卸载”确认移除本技能，其他输入取消") in {"卸载", "uninstall"}:
+                    print_result(installation.uninstall(), human=True)
                     return
             else:
-                print("Choose 0 through 6.")
+                print("请输入 0 到 6 的菜单编号。")
         except EOFError:
             return
         except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
-            print(f"Error: {exc}", file=sys.stderr)
+            print(f"操作失败：{exc}", file=sys.stderr)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex-home", type=Path,
                         default=Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex"))
-    parser.add_argument("--source", type=Path, help="Use a local repository checkout instead of downloading")
-    parser.add_argument("--bin-dir", type=Path, help="Directory for dw and delegate-workers commands")
+    parser.add_argument("--source", type=Path, help="使用本地源码目录进行安装")
+    parser.add_argument("--bin-dir", type=Path, help="dw 和 delegate-workers 命令的安装目录")
     commands = parser.add_subparsers(dest="command")
     for command in ("install", "update", "menu", "status", "rollback"):
         commands.add_parser(command)
@@ -438,7 +500,7 @@ def main(argv=None):
     configure.add_argument("--profile", required=True)
     configure.add_argument("--model")
     configure.add_argument("--effort")
-    configure.add_argument("--fallback", help="An existing worker profile, or none")
+    configure.add_argument("--fallback", help="已有的执行角色名称；none 表示无后备角色")
     configure.add_argument("--default", action="store_true")
     limits = commands.add_parser("limits")
     limits.add_argument("--parallel", type=int)
@@ -461,17 +523,17 @@ def main(argv=None):
             output = installation.rollback()
         elif args.command == "uninstall":
             if not args.yes:
-                raise ManagementError("Use uninstall --yes or choose Uninstall in the menu")
+                raise ManagementError("请使用 uninstall --yes，或在菜单中选择“卸载”")
             output = installation.uninstall()
         else:
             output = installation.status()
-        print_result(output)
+        print_result(output, human=sys.stdout.isatty())
         if args.command in {"install", "update", "rollback"}:
             installation.print_commands()
-            print("Open a new Codex task, then invoke $delegate-workers.")
+            print("请新建 Codex 任务，然后输入 $delegate-workers 和你的需求。")
         return 0
     except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+        print(f"操作失败：{exc}", file=sys.stderr)
         return 2
 
 
@@ -479,5 +541,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("\nCancelled.", file=sys.stderr)
+        print("\n已取消。", file=sys.stderr)
         sys.exit(130)

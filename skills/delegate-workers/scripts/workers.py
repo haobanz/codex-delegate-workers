@@ -22,7 +22,7 @@ def unique_object(pairs):
     result = {}
     for key, value in pairs:
         if key in result:
-            raise ConfigError(f"Duplicate JSON key: {key}")
+            raise ConfigError(f"JSON 中有重复字段：{key}")
         result[key] = value
     return result
 
@@ -32,35 +32,35 @@ def read_json(path):
         return json.loads(Path(path).read_text(encoding="utf-8"),
                           object_pairs_hook=unique_object)
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ConfigError(f"Cannot read JSON from {path}: {exc}") from exc
+        raise ConfigError(f"无法读取 JSON 配置 {path}：{exc}") from exc
 
 
 def check_fields(value, required, optional, label):
     if not isinstance(value, dict):
-        raise ConfigError(f"{label} must be an object")
+        raise ConfigError(f"{label} 必须是 JSON 对象")
     missing = required - value.keys()
     unknown = value.keys() - required - optional
     if missing:
-        raise ConfigError(f"{label}: missing fields: {', '.join(sorted(missing))}")
+        raise ConfigError(f"{label} 缺少字段：{', '.join(sorted(missing))}")
     if unknown:
-        raise ConfigError(f"{label}: unknown fields: {', '.join(sorted(unknown))}")
+        raise ConfigError(f"{label} 包含未知字段：{', '.join(sorted(unknown))}")
 
 
 def check_int(value, label, minimum):
     if type(value) is not int or value < minimum:
-        raise ConfigError(f"{label} must be an integer >= {minimum}")
+        raise ConfigError(f"{label} 必须是大于或等于 {minimum} 的整数")
     return value
 
 
 def check_model(value):
     if not isinstance(value, str) or not MODEL_NAME.fullmatch(value):
-        raise ConfigError("model must be a non-empty model identifier")
+        raise ConfigError("执行模型 ID 不能为空，且必须使用有效的模型标识")
     return value
 
 
 def check_effort(value):
     if not isinstance(value, str) or value not in EFFORTS:
-        raise ConfigError(f"reasoning_effort must be one of: {', '.join(sorted(EFFORTS))}")
+        raise ConfigError(f"思考强度无效，可用的配置值为：{', '.join(sorted(EFFORTS))}")
     return value
 
 
@@ -68,30 +68,30 @@ def validate_config(config):
     check_fields(config, {"version", "default_profile", "max_parallel_workers",
                           "max_attempts_per_task", "profiles"}, set(), "config")
     if type(config["version"]) is not int or config["version"] != 1:
-        raise ConfigError("version must be 1")
+        raise ConfigError("配置格式版本 version 必须为 1")
     check_int(config["max_parallel_workers"], "max_parallel_workers", 1)
     check_int(config["max_attempts_per_task"], "max_attempts_per_task", 1)
     profiles = config["profiles"]
     if not isinstance(profiles, dict) or not profiles:
-        raise ConfigError("profiles must be a non-empty object")
+        raise ConfigError("执行角色 profiles 必须是非空对象")
     for name, profile in profiles.items():
         if not isinstance(name, str) or not PROFILE_NAME.fullmatch(name):
-            raise ConfigError(f"Invalid profile name: {name!r}")
+            raise ConfigError(f"角色名称无效：{name!r}；请使用小写英文字母开头，可含数字、下划线或连字符，最多 64 个字符")
         check_fields(profile, {"model", "reasoning_effort"}, {"fallback"}, name)
         check_model(profile["model"])
         check_effort(profile["reasoning_effort"])
         fallback = profile.get("fallback")
         if fallback is not None and (not isinstance(fallback, str) or fallback not in profiles):
-            raise ConfigError(f"{name}: fallback must name an existing profile or be null")
+            raise ConfigError(f"{name} 的后备角色必须已存在，或设置为 null 关闭升级")
     default = config["default_profile"]
     if not isinstance(default, str) or default not in profiles:
-        raise ConfigError("default_profile must name an existing profile")
+        raise ConfigError("默认执行角色 default_profile 必须指向已有角色")
     for name in profiles:
         visited = set()
         current = name
         while current is not None:
             if current in visited:
-                raise ConfigError(f"Fallback cycle involving profile: {current}")
+                raise ConfigError(f"后备角色形成循环，请修改角色 {current} 的升级路径")
             visited.add(current)
             current = profiles[current].get("fallback")
     return config
@@ -100,16 +100,16 @@ def validate_config(config):
 def validate_capabilities(capabilities):
     check_fields(capabilities, {"models"}, set(), "capabilities")
     if not isinstance(capabilities["models"], list):
-        raise ConfigError("capabilities.models must be a list")
+        raise ConfigError("模型能力列表 capabilities.models 必须是数组")
     models = {}
     for item in capabilities["models"]:
         check_fields(item, {"model", "reasoning_efforts"}, set(), "capability")
         model = check_model(item["model"])
         if model in models:
-            raise ConfigError(f"Duplicate capability model: {model}")
+            raise ConfigError(f"模型能力列表中存在重复模型：{model}")
         efforts = item["reasoning_efforts"]
         if not isinstance(efforts, list):
-            raise ConfigError("capability.reasoning_efforts must be a list")
+            raise ConfigError("模型支持的思考强度 reasoning_efforts 必须是数组")
         models[model] = {check_effort(effort) for effort in efforts}
     return models
 
@@ -127,20 +127,20 @@ def resolve(config, *, profile=None, model=None, effort=None, escalate_from=None
     if model is not None:
         check_model(model)
         if effort is None:
-            raise ConfigError("A model override requires an explicit --effort")
+            raise ConfigError("临时更改执行模型时，必须同时指定思考强度 --effort")
     if effort is not None:
         check_effort(effort)
     if escalate_from is not None and any(value is not None for value in (profile, model, effort)):
-        raise ConfigError("--escalate-from cannot be combined with --profile, --model, or --effort")
+        raise ConfigError("--escalate-from 不能与 --profile、--model 或 --effort 同时使用")
     if escalate_from is not None and attempt < 2:
-        raise ConfigError("Escalation requires --attempt >= 2")
+        raise ConfigError("失败升级需要已有一次尝试，请设置 --attempt 为 2 或更大值")
     known_models = None if capabilities is None else validate_capabilities(capabilities)
     profiles = config["profiles"]
     selected = escalate_from if escalate_from is not None else profile
     if selected is None:
         selected = config["default_profile"]
     if not isinstance(selected, str) or selected not in profiles:
-        raise ConfigError(f"Unknown profile: {selected!r}")
+        raise ConfigError(f"执行角色不存在：{selected!r}")
     result = {
         "action": "return_to_parent",
         "main_session": "unchanged",
