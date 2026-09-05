@@ -332,6 +332,8 @@ def menu(installation, source=None, stream=None):
             with open("/dev/tty", "r", encoding="utf-8") as terminal:
                 return menu(installation, source, terminal)
         except OSError as exc:
+            if sys.stdin.isatty():
+                return menu(installation, source, sys.stdin)
             raise ManagementError("The menu needs a terminal; use install, update, configure, or status in scripts") from exc
     while True:
         print("\nDelegate Workers\n"

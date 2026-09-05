@@ -200,6 +200,14 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(config["max_parallel_workers"], 2)
         self.assertEqual(config["max_attempts_per_task"], 4)
 
+    def test_menu_uses_terminal_stdin_when_dev_tty_is_unavailable(self):
+        replies = io.StringIO("0\n")
+        with patch("builtins.open", side_effect=OSError("no controlling terminal")), \
+                patch.object(manage.sys, "stdin", replies), \
+                patch.object(replies, "isatty", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            manage.menu(self.installation)
+
     def test_failed_download_preserves_installation(self):
         self.install()
         old = (self.installation.skill / manage.RECEIPT).read_bytes()
