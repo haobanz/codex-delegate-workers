@@ -72,6 +72,18 @@ class PlatformTests(unittest.TestCase):
             self.assertEqual(result.returncode, 7)
             self.assertIn("中文输出", result.stdout)
 
+    @unittest.skipUnless(os.name == "nt" and os.environ.get("GITHUB_ACTIONS") == "true", "Ephemeral Windows CI registry")
+    def test_native_user_path_round_trip(self):
+        before = platform.read_user_path()
+        value, value_type = before if before is not None else ("", 2)
+        after = (platform.update_path(value, r"C:\delegate-workers-ci-only\中文"), value_type)
+        try:
+            platform.write_user_path(after)
+            self.assertEqual(platform.read_user_path(), after)
+        finally:
+            platform.write_user_path(before)
+        self.assertEqual(platform.read_user_path(), before)
+
 
 if __name__ == "__main__":
     unittest.main()

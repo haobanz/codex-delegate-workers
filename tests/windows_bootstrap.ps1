@@ -19,8 +19,8 @@ function Assert-BytesEqual {
 }
 
 function Invoke-Bootstrap {
-    param([string[]]$Arguments)
-    & $script:InstallScript @Arguments
+    param([hashtable]$Options)
+    & $script:InstallScript @Options
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
         throw "install.ps1 failed with exit code $exitCode"
@@ -63,7 +63,7 @@ try {
     [System.IO.File]::WriteAllBytes($sentinelPath, $sentinelBytes)
 
     $pathBefore = [Environment]::GetEnvironmentVariable('Path', 'Process')
-    Invoke-Bootstrap @('-Source', $repo, '-CodexHome', $codexHome, '-NoPath')
+    Invoke-Bootstrap @{ Source = $repo; CodexHome = $codexHome; NoPath = $true }
     Assert-True ($pathBefore -eq [Environment]::GetEnvironmentVariable('Path', 'Process')) `
         'NoPath changed the current process PATH'
 
@@ -83,9 +83,7 @@ try {
     $settingsPath = Join-Path $codexHome 'skills\delegate-workers\workers.json'
     $settingsBeforeUpdate = [System.IO.File]::ReadAllBytes($settingsPath)
 
-    Invoke-Bootstrap @(
-        '-Action', 'update', '-Source', $repo, '-CodexHome', $codexHome, '-NoPath'
-    )
+    Invoke-Bootstrap @{ Action = 'update'; Source = $repo; CodexHome = $codexHome; NoPath = $true }
     $settingsAfterUpdate = [System.IO.File]::ReadAllBytes($settingsPath)
     Assert-BytesEqual $settingsBeforeUpdate $settingsAfterUpdate 'workers.json'
 

@@ -22,14 +22,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - run: python -m unittest discover -s tests -v
+      - id: core-tests
+        run: python -m unittest discover -s tests -v
       - if: runner.os != 'Windows'
         run: bash -n install.sh
       - if: runner.os == 'Windows'
         name: Windows PowerShell 5.1 bootstrap
         shell: powershell
         run: .\tests\windows_bootstrap.ps1
-      - if: runner.os == 'Windows'
+      - if: always() && runner.os == 'Windows' && steps.core-tests.outcome == 'success'
         name: PowerShell 7 bootstrap
         shell: pwsh
         run: .\tests\windows_bootstrap.ps1
