@@ -39,6 +39,7 @@ class ManagementTests(unittest.TestCase):
         self.other_skill.parent.mkdir(parents=True)
         self.other_skill.write_text("unrelated skill", encoding="utf-8")
         self.installation = manage.Installation(self.home)
+        self.source_version = (self.source_skill / "VERSION").read_text().strip()
 
     def tearDown(self):
         self.assertEqual(self.main_config.read_bytes(), self.main_bytes)
@@ -156,7 +157,7 @@ class ManagementTests(unittest.TestCase):
         self.install()
         self.installation.configure("default", effort="high")
         result = self.installation.rollback()
-        self.assertEqual(result["version"], "0.1.0")
+        self.assertEqual(result["version"], self.source_version)
         self.assertEqual(self.installation.config()["profiles"]["default"]["reasoning_effort"], "high")
 
     def test_failed_swap_restores_previous_code_and_launcher(self):
@@ -181,6 +182,7 @@ class ManagementTests(unittest.TestCase):
         result = self.installation.uninstall()
         self.assertFalse(self.installation.skill.exists())
         self.assertFalse(self.installation.launcher.exists())
+        self.assertFalse((self.installation.command_dir / "dw").exists())
         self.assertTrue((Path(result["backup"]) / "workers.json").is_file())
         self.installation.rollback()
         self.assertTrue(self.installation.skill.exists())
@@ -215,6 +217,57 @@ class ManagementTests(unittest.TestCase):
             with self.assertRaises(manage.ManagementError):
                 self.installation.install()
         self.assertEqual((self.installation.skill / manage.RECEIPT).read_bytes(), old)
+
+    def test_short_command_runs_from_path(self):
+        self.install()
+        environment = {**os.environ, "PATH": str(self.installation.command_dir) + os.pathsep + os.environ["PATH"]}
+        result = subprocess.run(["dw", "status"], env=environment, cwd=self.root,
+                                capture_output=True, text=True, check=True)
+        self.assertTrue(json.loads(result.stdout)["installed"])
+        self.assertEqual(json.loads(result.stdout)["menu_command"], "dw")
+
+    def test_short_command_without_arguments_opens_menu(self):
+        self.install()
+        replies = io.StringIO("0\n")
+        with patch("builtins.open", side_effect=OSError("no controlling terminal")), \
+                patch.object(manage.sys, "stdin", replies), \
+                patch.object(replies, "isatty", return_value=True), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(manage.main(["--codex-home", str(self.home)]), 0)
+        self.assertIn("Worker model settings", output.getvalue())
+
+    def test_custom_command_directory_survives_subsequent_launch(self):
+        commands = self.root / "user bin"
+        self.installation = manage.Installation(self.home, commands)
+        self.install()
+        result = subprocess.run([str(commands / "dw"), "status"], capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout)["command_dir"], str(commands))
+        self.assertTrue((commands / "delegate-workers").exists())
+
+    def test_short_name_conflict_preserves_existing_command(self):
+        command = self.installation.command_dir / "dw"
+        command.parent.mkdir(parents=True)
+        command.write_text("another tool", encoding="utf-8")
+        with self.assertRaises(manage.ManagementError):
+            self.install()
+        self.assertEqual(command.read_text(), "another tool")
+        self.assertFalse(self.installation.skill.exists())
+
+    def test_update_adds_short_command_to_legacy_installation(self):
+        self.install()
+        receipt_path = self.installation.skill / manage.RECEIPT
+        receipt = json.loads(receipt_path.read_text())
+        receipt.pop("command_dir")
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        (self.installation.command_dir / "dw").unlink()
+        self.installation = manage.Installation(self.home)
+        self.install()
+        self.assertTrue((self.installation.command_dir / "dw").is_file())
+
+    def test_user_install_defaults_to_local_bin(self):
+        with patch.object(Path, "home", return_value=self.root), patch.dict(os.environ, {"CODEX_HOME": ""}):
+            installation = manage.Installation(self.root / ".codex")
+        self.assertEqual(installation.command_dir, self.root / ".local/bin")
 
 
 if __name__ == "__main__":

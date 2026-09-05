@@ -80,6 +80,9 @@ def load_receipt(directory):
         raise ManagementError(f"Invalid installation receipt: {receipt_path}")
     if any(not isinstance(value.get(key), str) or not value[key] for key in ("version", "revision")):
         raise ManagementError(f"Invalid version or revision in receipt: {receipt_path}")
+    if "command_dir" in value and (not isinstance(value["command_dir"], str)
+                                   or not Path(value["command_dir"]).is_absolute()):
+        raise ManagementError(f"Invalid command directory in receipt: {receipt_path}")
     for relative, digest in value["files"].items():
         path = PurePosixPath(relative)
         if (not relative or path.is_absolute() or ".." in path.parts or "\\" in relative
@@ -89,11 +92,35 @@ def load_receipt(directory):
 
 
 class Installation:
-    def __init__(self, codex_home):
+    def __init__(self, codex_home, bin_dir=None):
         self.home = Path(codex_home).expanduser().resolve()
         self.skill = self.home / "skills" / PROJECT
         self.launcher = self.home / "bin" / PROJECT
         self.backups = self.home / "delegate-workers-backups"
+        receipt = load_receipt(self.skill)
+        saved_bin = receipt.get("command_dir") if receipt else None
+        user_codex = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
+        default_bin = Path.home() / ".local/bin" if self.home == user_codex else self.home / "bin"
+        self.command_dir = Path(bin_dir or saved_bin or default_bin).expanduser().resolve()
+        if saved_bin and self.command_dir != Path(saved_bin):
+            raise ManagementError("This installation already has a command directory; uninstall before changing it")
+
+    def launchers(self):
+        return list(dict.fromkeys((self.launcher, self.command_dir / "dw", self.command_dir / PROJECT)))
+
+    def menu_command(self):
+        executable = shutil.which("dw")
+        if executable and Path(executable).resolve() == self.command_dir / "dw":
+            return "dw"
+        return shlex.quote(str(self.command_dir / "dw"))
+
+    def print_commands(self):
+        print(f"\nMenu: {self.menu_command()}")
+        print(f"Update: {self.menu_command()} update")
+        path_dirs = [Path(part).expanduser().resolve() for part in os.get_exec_path() if part]
+        if self.command_dir not in path_dirs:
+            print("Add the command directory to PATH once in your shell configuration:")
+            print(f'export PATH={shlex.quote(str(self.command_dir))}:"$PATH"')
 
     @contextlib.contextmanager
     def locked(self):
@@ -114,10 +141,22 @@ class Installation:
         return (f'#!/bin/sh\n# Managed by Delegate Workers\nexec {command} "$@"\n').encode()
 
     def check_launcher(self):
-        if self.launcher.is_symlink():
-            raise ManagementError(f"Launcher is a symlink: {self.launcher}")
-        if self.launcher.exists() and self.launcher.read_bytes() != self.launcher_content():
-            raise ManagementError(f"Launcher contains unmanaged changes: {self.launcher}")
+        for launcher in self.launchers():
+            if launcher.is_symlink():
+                raise ManagementError(f"Launcher is a symlink: {launcher}")
+            if launcher.exists() and launcher.read_bytes() != self.launcher_content():
+                raise ManagementError(f"Launcher contains unmanaged changes: {launcher}")
+
+    def write_launchers(self):
+        for launcher in self.launchers():
+            atomic_write(launcher, self.launcher_content(), 0o755)
+
+    def restore_launchers(self, previous):
+        for launcher, contents in previous.items():
+            if contents is not None:
+                atomic_write(launcher, contents, 0o755)
+            elif launcher.is_file() and launcher.read_bytes() == self.launcher_content():
+                launcher.unlink()
 
     def config(self):
         if load_receipt(self.skill) is None:
@@ -162,7 +201,7 @@ class Installation:
         self.skill.parent.mkdir(parents=True, exist_ok=True)
         stage = Path(tempfile.mkdtemp(prefix=".delegate-workers-stage-", dir=self.skill.parent))
         backup = None
-        old_launcher = self.launcher.read_bytes() if self.launcher.exists() else None
+        old_launchers = {path: path.read_bytes() if path.exists() else None for path in self.launchers()}
         try:
             if old:
                 shutil.copytree(self.skill, stage, dirs_exist_ok=True,
@@ -181,12 +220,13 @@ class Installation:
             if validation.returncode:
                 raise ManagementError("Candidate rejected the worker settings: " + validation.stderr.strip())
             receipt = {"schema_version": 1, "project": PROJECT, "repository": REPOSITORY,
-                       "version": version, "revision": revision, "files": files}
+                       "version": version, "revision": revision, "files": files,
+                       "command_dir": str(self.command_dir)}
             atomic_write(stage / RECEIPT, json_bytes(receipt))
             if old and old == receipt:
-                atomic_write(self.launcher, self.launcher_content(), 0o755)
+                self.write_launchers()
                 return {"result": "unchanged", "version": version, "revision": revision}
-            atomic_write(self.launcher, self.launcher_content(), 0o755)
+            self.write_launchers()
             if old:
                 backup = self.backup_path()
                 self.skill.rename(backup)
@@ -199,11 +239,7 @@ class Installation:
             return {"result": "updated" if old else "installed", "version": version,
                     "revision": revision, "backup": str(backup) if backup else None}
         except BaseException:
-            if old_launcher is None:
-                if self.launcher.is_file() and self.launcher.read_bytes() == self.launcher_content():
-                    self.launcher.unlink()
-            else:
-                atomic_write(self.launcher, old_launcher, 0o755)
+            self.restore_launchers(old_launchers)
             raise
         finally:
             if stage.exists():
@@ -263,6 +299,7 @@ class Installation:
             return {"installed": False, "skill": str(self.skill)}
         return {"installed": True, "version": receipt["version"], "revision": receipt["revision"],
                 "skill": str(self.skill), "launcher": str(self.launcher),
+                "command_dir": str(self.command_dir), "menu_command": self.menu_command(),
                 "local_code_changes": self.changed_files(receipt), "config": self.config(),
                 "main_session": "unchanged"}
 
@@ -280,13 +317,16 @@ class Installation:
             if load_receipt(self.skill) is None:
                 return {"result": "not_installed"}
             self.check_launcher()
+            old_launchers = {path: path.read_bytes() if path.exists() else None for path in self.launchers()}
             backup = self.backup_path()
             self.skill.rename(backup)
             try:
-                if self.launcher.exists():
-                    self.launcher.unlink()
+                for launcher in self.launchers():
+                    if launcher.exists():
+                        launcher.unlink()
             except BaseException:
                 backup.rename(self.skill)
+                self.restore_launchers(old_launchers)
                 raise
             return {"result": "uninstalled", "backup": str(backup)}
 
@@ -346,7 +386,7 @@ def menu(installation, source=None, stream=None):
             if choice == "1":
                 print_result(installation.install(source))
                 print("Open a new Codex task to load changed skill instructions.")
-                print(f"Reopen the menu with: {shlex.quote(str(installation.launcher))} menu")
+                installation.print_commands()
                 return
             elif choice == "2":
                 config = installation.config()
@@ -390,6 +430,7 @@ def main(argv=None):
     parser.add_argument("--codex-home", type=Path,
                         default=Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex"))
     parser.add_argument("--source", type=Path, help="Use a local repository checkout instead of downloading")
+    parser.add_argument("--bin-dir", type=Path, help="Directory for dw and delegate-workers commands")
     commands = parser.add_subparsers(dest="command")
     for command in ("install", "update", "menu", "status", "rollback"):
         commands.add_parser(command)
@@ -405,8 +446,8 @@ def main(argv=None):
     uninstall = commands.add_parser("uninstall")
     uninstall.add_argument("--yes", action="store_true")
     args = parser.parse_args(argv)
-    installation = Installation(args.codex_home)
     try:
+        installation = Installation(args.codex_home, args.bin_dir)
         if args.command is None or args.command == "menu":
             menu(installation, args.source)
             return 0
@@ -426,7 +467,7 @@ def main(argv=None):
             output = installation.status()
         print_result(output)
         if args.command in {"install", "update", "rollback"}:
-            print(f"\nMenu: {shlex.quote(str(installation.launcher))} menu")
+            installation.print_commands()
             print("Open a new Codex task, then invoke $delegate-workers.")
         return 0
     except (ValueError, OSError, subprocess.TimeoutExpired) as exc:

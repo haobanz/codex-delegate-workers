@@ -19,10 +19,10 @@
 curl -fsSL https://raw.githubusercontent.com/haobanz/codex-delegate-workers/main/install.sh | bash
 ```
 
-安装完成后，打开设置菜单：
+安装完成后，直接输入两个字母打开设置菜单：
 
 ```bash
-"${CODEX_HOME:-$HOME/.codex}/bin/delegate-workers" menu
+dw
 ```
 
 也可以通过在线命令直接打开安装和更新菜单：
@@ -32,6 +32,8 @@ curl -fsSL https://raw.githubusercontent.com/haobanz/codex-delegate-workers/main
 ```
 
 首次安装使用默认执行配置。菜单读取终端输入，可以通过上述管道命令正常交互；没有终端的脚本环境请使用后面的非交互命令。
+
+`delegate-workers` 和 `dw menu` 也可以打开同一个菜单。旧版用户重新运行上面的一键安装命令即可补装短命令，执行模型设置会保留。
 
 ## 设置步骤
 
@@ -73,7 +75,7 @@ $delegate-workers
 已安装时：
 
 ```bash
-"${CODEX_HOME:-$HOME/.codex}/bin/delegate-workers" update
+dw update
 ```
 
 或者使用在线更新命令：
@@ -95,29 +97,29 @@ curl -fsSL https://raw.githubusercontent.com/haobanz/codex-delegate-workers/main
 更改默认执行模型与强度：
 
 ```bash
-"${CODEX_HOME:-$HOME/.codex}/bin/delegate-workers" configure \
+dw configure \
   --profile default --model gpt-5.6-luna --effort high
 ```
 
 关闭默认角色的失败升级：
 
 ```bash
-"${CODEX_HOME:-$HOME/.codex}/bin/delegate-workers" configure \
+dw configure \
   --profile default --fallback none
 ```
 
 设置并发和尝试次数：
 
 ```bash
-"${CODEX_HOME:-$HOME/.codex}/bin/delegate-workers" limits --parallel 2 --attempts 3
+dw limits --parallel 2 --attempts 3
 ```
 
 状态、回滚、卸载：
 
 ```bash
-"${CODEX_HOME:-$HOME/.codex}/bin/delegate-workers" status
-"${CODEX_HOME:-$HOME/.codex}/bin/delegate-workers" rollback
-"${CODEX_HOME:-$HOME/.codex}/bin/delegate-workers" uninstall --yes
+dw status
+dw rollback
+dw uninstall --yes
 ```
 
 卸载仅移除本项目的 Skill 和启动器，并保留可恢复的备份。不会删除其他 Skill、项目文件或 Codex 主代理配置。
@@ -127,8 +129,11 @@ curl -fsSL https://raw.githubusercontent.com/haobanz/codex-delegate-workers/main
 默认使用 `~/.codex`；如果设置了 `CODEX_HOME`，使用该路径。
 
 ```text
+~/.local/bin/
+  dw                                  短命令，默认打开菜单
+  delegate-workers                    完整命令
 ~/.codex/
-  bin/delegate-workers                 管理菜单和命令入口
+  bin/delegate-workers                 兼容旧版本的命令入口
   skills/delegate-workers/             Skill 与管理工具
     workers.json                       唯一的持久执行模型配置
     workers.json.bak                   最近一次设置修改前的备份
@@ -136,7 +141,15 @@ curl -fsSL https://raw.githubusercontent.com/haobanz/codex-delegate-workers/main
   delegate-workers-backups/            更新与卸载备份
 ```
 
-安装器不会修改 PATH、Shell 启动文件、`AGENTS.md` 或 `config.toml`。直接使用上面的完整命令路径即可。
+短命令默认安装到 `~/.local/bin`。安装器检查 PATH，如果当前 Shell 没有包含该目录，会输出一次性的设置命令：
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+将这行加入 Bash 的 `~/.bashrc` 或 Zsh 的 `~/.zshrc` 可使新终端也生效。安装器不修改 Shell 启动文件、`AGENTS.md` 或 `config.toml`，也不会覆盖已有的同名程序。
+
+通过 `--codex-home` 指定隔离安装目录时，命令默认放在该目录的 `bin` 中；可以用 `--bin-dir PATH` 明确指定短命令位置。
 
 ## 本地开发与测试
 
@@ -151,7 +164,7 @@ python3 skills/delegate-workers/scripts/manage.py --source . install
 ```bash
 python3 skills/delegate-workers/scripts/manage.py \
   --codex-home /tmp/delegate-workers-demo --source . install
-/tmp/delegate-workers-demo/bin/delegate-workers menu
+/tmp/delegate-workers-demo/bin/dw
 ```
 
 运行验证：
