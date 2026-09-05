@@ -25,6 +25,7 @@ PROJECT = "delegate-workers"
 REPOSITORY = "https://github.com/haobanz/codex-delegate-workers.git"
 RECEIPT = ".delegate-workers-install.json"
 REQUIRED = {"SKILL.md", "workers.json", "VERSION", "scripts/workers.py", "scripts/manage.py"}
+RUNTIME_REQUIRED = {"scripts/activation.py", "references/default-delegation.md"}
 EFFORT_LABELS = {"low": "低", "medium": "中", "high": "高", "xhigh": "超高",
                  "max": "最大", "ultra": "极限", "minimal": "最低", "none": "关闭"}
 
@@ -67,6 +68,32 @@ def inventory(directory):
         if path.is_file() and relative.as_posix() not in {RECEIPT, "workers.json", "workers.json.bak"}:
             result[relative.as_posix()] = file_hash(path)
     return result
+
+
+def validate_staged_candidate(stage, managed_files):
+    python_files = sorted(stage / name for name in managed_files if name.endswith(".py"))
+    for path in python_files:
+        try:
+            validation = subprocess.run(
+                [sys.executable, "-m", "py_compile", str(path)],
+                capture_output=True, text=True, check=False, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ManagementError(f"新版本 Python 脚本检查失败，已停止更新：{path.relative_to(stage)}") from exc
+        if validation.returncode:
+            detail = validation.stderr.strip() or validation.stdout.strip()
+            raise ManagementError(f"新版本 Python 脚本无效，已停止更新：{path.relative_to(stage)}"
+                                  + (f"：{detail}" if detail else ""))
+
+    try:
+        startup = subprocess.run(
+            [sys.executable, str(stage / "scripts/manage.py"), "--help"],
+            capture_output=True, text=True, check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ManagementError("新版本管理入口无法启动，已停止更新") from exc
+    if startup.returncode:
+        detail = startup.stderr.strip() or startup.stdout.strip()
+        raise ManagementError("新版本管理入口无法启动，已停止更新"
+                              + (f"：{detail}" if detail else ""))
 
 
 def load_receipt(directory):
@@ -208,10 +235,11 @@ class Installation:
         source = Path(source).resolve()
         present = inventory(source)
         files = present if source_files is None else source_files
-        for relative in REQUIRED:
+        required_files = REQUIRED | RUNTIME_REQUIRED
+        for relative in required_files:
             if not (source / relative).is_file():
                 raise ManagementError(f"新版本缺少必要文件：{relative}")
-        if not (REQUIRED - {"workers.json"}) <= files.keys():
+        if not (required_files - {"workers.json"}) <= files.keys():
             raise ManagementError("版本文件清单缺少必要文件")
         for relative, digest in files.items():
             if present.get(relative) != digest:
@@ -226,10 +254,10 @@ class Installation:
             restored_receipt = load_receipt(source)
             requested_mode = (restored_receipt.get("activation") or {"mode": "auto"})["mode"]
         template_path = source / "references/default-delegation.md"
-        template = template_path.read_text(encoding="utf-8") if template_path.is_file() else None
+        template = template_path.read_text(encoding="utf-8")
         activation_state, rule_edits = activation.plan(
             self.home, self.skill, previous_activation,
-            requested_mode if template is not None else "on-demand", template)
+            requested_mode, template)
         self.check_launcher()
         if old:
             changes = self.changed_files(old)
@@ -256,15 +284,25 @@ class Installation:
             if not old:
                 shutil.copyfile(source / "workers.json", stage / "workers.json")
             validation = subprocess.run(
-                [sys.executable, str(stage / "scripts/workers.py"), "validate"],
+                [sys.executable, str(stage / "scripts/workers.py"), "show"],
                 capture_output=True, text=True, check=False, timeout=30)
             if validation.returncode:
                 raise ManagementError("新版本无法读取当前执行配置，已停止更新：" + validation.stderr.strip())
+            try:
+                migrated = workers.validate_config(json.loads(validation.stdout))
+            except json.JSONDecodeError as exc:
+                raise ManagementError("新版本返回的模型配置无效，已停止更新") from exc
+            config_path = stage / "workers.json"
+            config_changed = migrated != workers.read_json(config_path)
+            if config_changed:
+                atomic_write(stage / "workers.json.bak", config_path.read_bytes())
+                atomic_write(config_path, json_bytes(migrated))
+            validate_staged_candidate(stage, files)
             receipt = {"schema_version": 1, "project": PROJECT, "repository": REPOSITORY,
                        "version": version, "revision": revision, "files": files,
                        "command_dir": str(self.command_dir), "activation": activation_state}
             atomic_write(stage / RECEIPT, json_bytes(receipt))
-            if old and old == receipt:
+            if old and old == receipt and not config_changed:
                 self.write_launchers()
                 return {"result": "unchanged", "version": version, "revision": revision}
             with self.rules_transaction(rule_edits):
@@ -301,12 +339,12 @@ class Installation:
                 return self.apply(root / "skills" / PROJECT, revision_of(root))
 
     def save_config(self, config):
-        workers.validate_config(config)
+        config = workers.validate_config(config)
         previous = self.skill / "workers.json"
         atomic_write(self.skill / "workers.json.bak", previous.read_bytes())
         atomic_write(previous, json_bytes(config))
 
-    def configure(self, profile, model=None, effort=None, fallback=None, default=False):
+    def configure(self, profile, model=None, effort=None, default=False):
         with self.locked():
             config = copy.deepcopy(self.config())
             current = config["profiles"].get(profile, {})
@@ -317,21 +355,9 @@ class Installation:
                 candidate["model"] = model
             if effort is not None:
                 candidate["reasoning_effort"] = effort
-            if fallback is not None:
-                candidate["fallback"] = None if fallback == "none" else fallback
             config["profiles"][profile] = candidate
             if default:
                 config["default_profile"] = profile
-            self.save_config(config)
-            return config
-
-    def set_limits(self, parallel=None, attempts=None):
-        with self.locked():
-            config = copy.deepcopy(self.config())
-            if parallel is not None:
-                config["max_parallel_workers"] = parallel
-            if attempts is not None:
-                config["max_attempts_per_task"] = attempts
             self.save_config(config)
             return config
 
@@ -415,19 +441,16 @@ def revision_of(root):
 
 
 def profile_label(name):
-    return {"default": "常规执行（default）", "complex": "困难任务（complex）"}.get(name, name)
+    return {"default": "常用模型（default）", "complex": "备选模型（complex）"}.get(name, name)
 
 
 def print_config(config):
-    print(f"默认执行角色：{profile_label(config['default_profile'])}")
-    print(f"最多并行子代理数：{config['max_parallel_workers']}")
-    print(f"每个任务最多尝试次数：{config['max_attempts_per_task']}")
+    print(f"默认执行预设：{profile_label(config['default_profile'])}")
     for name, profile in config["profiles"].items():
         effort = profile["reasoning_effort"]
         print(f"\n  {profile_label(name)}")
         print(f"    模型：{profile['model']}")
         print(f"    思考强度：{EFFORT_LABELS.get(effort, effort)}（{effort}）")
-        print(f"    后备角色：{profile_label(profile['fallback']) if profile.get('fallback') else '无'}")
 
 
 def print_activation(state):
@@ -484,13 +507,6 @@ def select_effort(stream, current):
     return {label: effort for effort, label in EFFORT_LABELS.items()}.get(choice, choice)
 
 
-def prompt_count(stream, label, default):
-    try:
-        return int(prompt(stream, label, default))
-    except ValueError as exc:
-        raise ManagementError(f"{label}必须填写整数") from exc
-
-
 def prompt(stream, label, default=None):
     suffix = f" [{default}]" if default is not None else ""
     print(f"{label}{suffix}: ", end="", flush=True)
@@ -514,9 +530,8 @@ def menu(installation, source=None, stream=None):
         if receipt:
             print_activation(activation.status(installation.home, receipt.get("activation")))
         print("\n执行子代理管理\n"
-              "1. 安装 / 更新\n2. 设置执行模型和思考强度\n3. 设置并发数和尝试次数\n"
-              "4. 查看状态和当前设置\n5. 回滚版本（保留执行设置）\n6. 卸载\n"
-              "7. 开启 / 关闭默认委派\n0. 退出")
+              "1. 安装 / 更新\n2. 设置执行模型和思考强度\n3. 查看状态和当前设置\n"
+              "4. 开启 / 关闭默认委派\n5. 回滚版本（保留执行设置）\n6. 卸载\n0. 退出")
         try:
             choice = prompt(stream, "请选择", "0")
             if choice == "0":
@@ -530,23 +545,14 @@ def menu(installation, source=None, stream=None):
                 config = installation.config()
                 for name, profile in config["profiles"].items():
                     print(f"  {profile_label(name)}：{profile['model']} / {EFFORT_LABELS[profile['reasoning_effort']]}")
-                name = prompt(stream, "执行角色名称（可输入已有名称或新名称）", config["default_profile"])
+                name = prompt(stream, "模型预设名称（可输入已有名称或新名称）", config["default_profile"])
                 current = config["profiles"].get(name, {})
                 model = prompt(stream, "执行模型 ID", current.get("model"))
                 effort = select_effort(stream, current.get("reasoning_effort", "medium"))
-                fallback = prompt(stream, "后备角色名称（输入“无”关闭升级）", current.get("fallback") or "无")
-                if fallback == "无":
-                    fallback = "none"
-                default = prompt(stream, "设为默认执行角色？是/否", "否").lower() in {"是", "y", "yes"}
-                installation.configure(name, model, effort, fallback, default)
+                default = prompt(stream, "设为默认执行预设？是/否", "否").lower() in {"是", "y", "yes"}
+                installation.configure(name, model, effort, default=default)
                 print("执行配置已保存，主代理设置未改变。")
             elif choice == "3":
-                config = installation.config()
-                parallel = prompt_count(stream, "最多并行子代理数", config["max_parallel_workers"])
-                attempts = prompt_count(stream, "每个任务最多尝试次数", config["max_attempts_per_task"])
-                installation.set_limits(parallel, attempts)
-                print("并发数和尝试次数已保存。")
-            elif choice == "4":
                 print_result(installation.status(), human=True)
             elif choice == "5":
                 print_result(installation.rollback(), human=True)
@@ -556,7 +562,7 @@ def menu(installation, source=None, stream=None):
                 if prompt(stream, "输入“卸载”确认移除本技能，其他输入取消") in {"卸载", "uninstall"}:
                     print_result(installation.uninstall(), human=True)
                     return
-            elif choice == "7":
+            elif choice == "4":
                 current = installation.status()
                 if not current["installed"]:
                     raise ManagementError("请先选择菜单 1 安装本技能")
@@ -566,7 +572,7 @@ def menu(installation, source=None, stream=None):
                     raise ManagementError("请输入 1 或 2")
                 print_result(installation.set_mode("auto" if answer == "1" else "on-demand"), human=True)
             else:
-                print("请输入 0 到 7 的菜单编号。")
+                print("请输入 0 到 6 的菜单编号。")
         except EOFError:
             return
         except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
@@ -586,11 +592,7 @@ def main(argv=None):
     configure.add_argument("--profile", required=True)
     configure.add_argument("--model")
     configure.add_argument("--effort")
-    configure.add_argument("--fallback", help="已有的执行角色名称；none 表示无后备角色")
     configure.add_argument("--default", action="store_true")
-    limits = commands.add_parser("limits")
-    limits.add_argument("--parallel", type=int)
-    limits.add_argument("--attempts", type=int)
     mode = commands.add_parser("mode", help="开启或关闭默认委派")
     mode.add_argument("value", choices=["auto", "on-demand"])
     uninstall = commands.add_parser("uninstall")
@@ -604,9 +606,7 @@ def main(argv=None):
         if args.command in {"install", "update"}:
             output = installation.install(args.source, require_existing=args.command == "update")
         elif args.command == "configure":
-            output = installation.configure(args.profile, args.model, args.effort, args.fallback, args.default)
-        elif args.command == "limits":
-            output = installation.set_limits(args.parallel, args.attempts)
+            output = installation.configure(args.profile, args.model, args.effort, default=args.default)
         elif args.command == "mode":
             output = installation.set_mode(args.value)
         elif args.command == "rollback":

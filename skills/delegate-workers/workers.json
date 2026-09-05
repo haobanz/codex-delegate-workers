@@ -1,13 +1,10 @@
 {
-  "version": 1,
+  "version": 2,
   "default_profile": "default",
-  "max_parallel_workers": 3,
-  "max_attempts_per_task": 2,
   "profiles": {
     "default": {
       "model": "gpt-5.6-luna",
-      "reasoning_effort": "medium",
-      "fallback": "complex"
+      "reasoning_effort": "medium"
     },
     "complex": {
       "model": "gpt-5.6-terra",

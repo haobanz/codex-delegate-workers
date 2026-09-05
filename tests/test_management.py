@@ -51,6 +51,20 @@ class ManagementTests(unittest.TestCase):
     def release(self, version="9.9.9"):
         (self.source_skill / "VERSION").write_text(version + "\n", encoding="utf-8")
 
+    def installation_snapshot(self):
+        paths = [
+            self.installation.skill / manage.RECEIPT,
+            self.installation.skill / "workers.json",
+            self.home / "AGENTS.md",
+            self.home / "AGENTS.override.md",
+            *self.installation.launchers(),
+        ]
+        return {path: path.read_bytes() if path.exists() else None for path in set(paths)}
+
+    def assert_installation_snapshot(self, snapshot):
+        for path, contents in snapshot.items():
+            self.assertEqual(path.read_bytes() if path.exists() else None, contents, path)
+
     def test_install_and_reinstall_are_idempotent(self):
         self.assertEqual(self.install()["result"], "installed")
         self.assertEqual(self.install()["result"], "unchanged")
@@ -66,8 +80,7 @@ class ManagementTests(unittest.TestCase):
 
     def test_update_preserves_settings_and_unmanaged_files(self):
         self.install()
-        self.installation.configure("default", "custom/model", "low", "none")
-        self.installation.set_limits(parallel=2, attempts=4)
+        self.installation.configure("default", "custom/model", "low")
         settings = (self.installation.skill / "workers.json").read_bytes()
         extra = self.installation.skill / "personal-notes.txt"
         extra.write_text("keep this", encoding="utf-8")
@@ -80,7 +93,7 @@ class ManagementTests(unittest.TestCase):
 
     def test_new_profile_and_default_can_be_configured(self):
         self.install()
-        config = self.installation.configure("batch", "future-model", "medium", "none", True)
+        config = self.installation.configure("batch", "future-model", "medium", default=True)
         self.assertEqual(config["default_profile"], "batch")
         self.assertEqual(self.installation.config()["profiles"]["batch"]["model"], "future-model")
 
@@ -88,9 +101,9 @@ class ManagementTests(unittest.TestCase):
         self.install()
         previous = (self.installation.skill / "workers.json").read_bytes()
         for operation in (
-                lambda: self.installation.configure("complex", fallback="default"),
+                lambda: self.installation.configure("complex", effort="unknown"),
                 lambda: self.installation.configure("default", model="new-model"),
-                lambda: self.installation.set_limits(parallel=0)):
+                lambda: self.installation.configure("default", model="", effort="medium")):
             with self.assertRaises(ValueError):
                 operation()
             self.assertEqual((self.installation.skill / "workers.json").read_bytes(), previous)
@@ -103,6 +116,61 @@ class ManagementTests(unittest.TestCase):
             self.install()
         self.assertEqual((self.installation.skill / manage.RECEIPT).read_bytes(), old_receipt)
         self.assertFalse(self.installation.backups.exists())
+
+    def test_missing_runtime_module_rejects_update_without_state_changes(self):
+        self.install()
+        self.installation.configure("default", "custom/model", "low")
+        before = self.installation_snapshot()
+        (self.source_skill / "scripts/activation.py").unlink()
+        self.release()
+        with self.assertRaises(manage.ManagementError):
+            self.install()
+        self.assert_installation_snapshot(before)
+        self.assertEqual(self.installation.status()["activation"]["mode"], "auto")
+        self.assertFalse(self.installation.backups.exists())
+
+    def test_missing_template_rejects_update_without_disabling_auto_mode(self):
+        self.install()
+        before = self.installation_snapshot()
+        (self.source_skill / "references/default-delegation.md").unlink()
+        self.release()
+        with self.assertRaises(manage.ManagementError):
+            self.install()
+        self.assert_installation_snapshot(before)
+        self.assertEqual(self.installation.status()["activation"]["mode"], "auto")
+        self.assertTrue(self.installation.status()["activation"]["rule_present"])
+
+    def test_management_syntax_failure_rejects_update_without_state_changes(self):
+        self.install()
+        before = self.installation_snapshot()
+        (self.source_skill / "scripts/manage.py").write_text("def broken(:\n", encoding="utf-8")
+        self.release()
+        with self.assertRaises(manage.ManagementError):
+            self.install()
+        self.assert_installation_snapshot(before)
+
+    def test_management_import_failure_rejects_update_without_state_changes(self):
+        self.install()
+        before = self.installation_snapshot()
+        candidate = self.source_skill / "scripts/manage.py"
+        candidate.write_text("import module_that_does_not_exist\n" + candidate.read_text(),
+                             encoding="utf-8")
+        self.release()
+        with self.assertRaises(manage.ManagementError):
+            self.install()
+        self.assert_installation_snapshot(before)
+
+    def test_rollback_rejects_backup_missing_runtime_dependency_without_state_changes(self):
+        self.install()
+        self.release()
+        result = self.install()
+        backup = Path(result["backup"])
+        (backup / "scripts/activation.py").unlink()
+        before = self.installation_snapshot()
+        with self.assertRaises(manage.ManagementError):
+            self.installation.rollback()
+        self.assert_installation_snapshot(before)
+        self.assertEqual(self.installation.status()["activation"]["mode"], "auto")
 
     def test_local_code_changes_block_update_without_overwriting(self):
         self.install()
@@ -190,17 +258,16 @@ class ManagementTests(unittest.TestCase):
     def test_concurrent_operations_are_rejected(self):
         self.install()
         with self.installation.locked(), self.assertRaises(manage.ManagementError):
-            self.installation.set_limits(parallel=2)
+            self.installation.configure("default", effort="high")
 
-    def test_menu_can_configure_worker_and_limits(self):
+    def test_menu_can_configure_worker(self):
         self.install()
-        replies = io.StringIO("2\ndefault\ncustom-model\nhigh\nnone\nn\n3\n2\n4\n4\n0\n")
+        replies = io.StringIO("2\ndefault\ncustom-model\nhigh\nn\n3\n0\n")
         with contextlib.redirect_stdout(io.StringIO()):
             manage.menu(self.installation, self.source, replies)
         config = self.installation.config()
         self.assertEqual(config["profiles"]["default"]["model"], "custom-model")
-        self.assertEqual(config["max_parallel_workers"], 2)
-        self.assertEqual(config["max_attempts_per_task"], 4)
+        self.assertEqual(config["profiles"]["default"]["reasoning_effort"], "high")
 
     def test_menu_uses_terminal_stdin_when_dev_tty_is_unavailable(self):
         replies = io.StringIO("0\n")
@@ -240,13 +307,13 @@ class ManagementTests(unittest.TestCase):
         self.install()
         for choice in ("高", "3"):
             with self.subTest(choice=choice):
-                replies = io.StringIO(f"2\ncustom\ncustom-model\n{choice}\n无\n是\n0\n")
+                replies = io.StringIO(f"2\ncustom\ncustom-model\n{choice}\n是\n0\n")
                 with contextlib.redirect_stdout(io.StringIO()):
                     manage.menu(self.installation, self.source, replies)
                 config = self.installation.config()
                 self.assertEqual(config["default_profile"], "custom")
                 self.assertEqual(config["profiles"]["custom"]["reasoning_effort"], "high")
-                self.assertIsNone(config["profiles"]["custom"]["fallback"])
+                self.assertEqual(set(config["profiles"]["custom"]), {"model", "reasoning_effort"})
 
     def test_menu_accepts_chinese_uninstall_confirmation(self):
         self.install()
@@ -411,8 +478,36 @@ class ManagementTests(unittest.TestCase):
     def test_mode_can_be_changed_from_menu(self):
         self.install()
         with contextlib.redirect_stdout(io.StringIO()):
-            manage.menu(self.installation, self.source, io.StringIO("7\n2\n0\n"))
+            manage.menu(self.installation, self.source, io.StringIO("4\n2\n0\n"))
         self.assertEqual(self.installation.status()["activation"]["mode"], "on-demand")
+
+    def test_legacy_settings_migrate_without_changing_models_or_activation(self):
+        self.install()
+        self.installation.set_mode("on-demand")
+        legacy = {"version": 1, "default_profile": "default", "max_parallel_workers": 3,
+                  "max_attempts_per_task": 2, "profiles": {
+                      "default": {"model": "gpt-5.6-luna", "reasoning_effort": "max", "fallback": "complex"},
+                      "complex": {"model": "gpt-5.6-terra", "reasoning_effort": "xhigh", "fallback": None}}}
+        config_path = self.installation.skill / "workers.json"
+        config_path.write_text(json.dumps(legacy), encoding="utf-8")
+        original = config_path.read_bytes()
+        self.install()
+        current = json.loads(config_path.read_text())
+        self.assertEqual(current["version"], 2)
+        self.assertEqual(current["profiles"], {
+            "default": {"model": "gpt-5.6-luna", "reasoning_effort": "max"},
+            "complex": {"model": "gpt-5.6-terra", "reasoning_effort": "xhigh"}})
+        self.assertEqual((self.installation.skill / "workers.json.bak").read_bytes(), original)
+        self.assertEqual(set(current), {"version", "default_profile", "profiles"})
+        self.assertEqual(self.installation.status()["activation"]["mode"], "on-demand")
+
+    def test_unmanaged_python_file_is_preserved_without_becoming_release_dependency(self):
+        self.install()
+        extra = self.installation.skill / "unfinished-personal-script.py"
+        extra.write_text("def unfinished(:\n", encoding="utf-8")
+        self.release()
+        self.install()
+        self.assertEqual(extra.read_text(), "def unfinished(:\n")
 
     def test_unknown_rule_block_is_not_adopted(self):
         path = self.home / "AGENTS.md"
