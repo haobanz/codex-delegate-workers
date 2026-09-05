@@ -55,8 +55,24 @@ def default_bin():
 
 
 def windows_batch_launcher(*, legacy=False):
-    # Parse the exit with the dispatch so uninstall can remove the batch file.
-    ending = "\r\nexit /b %errorlevel%\r\n" if legacy else " & exit /b\r\n"
+    if not legacy:
+        # End batch processing before dispatch, as used by npm/cmd-shim:
+        # https://github.com/npm/cmd-shim/blob/main/lib/index.js
+        return (
+            "@echo off\r\n"
+            "rem Managed by Delegate Workers\r\n"
+            "setlocal DisableDelayedExpansion\r\n"
+            'set "delegatePython=python"\r\n'
+            'set "delegatePrefix="\r\n'
+            'py -3 -c "import sys; sys.exit(sys.version_info < (3, 10))" >nul 2>&1\r\n'
+            "if errorlevel 1 goto dispatch\r\n"
+            'set "delegatePython=py"\r\n'
+            'set "delegatePrefix=-3"\r\n'
+            ":dispatch\r\n"
+            "endlocal & goto _delegate_workers_undefined_ 2>nul || title %COMSPEC% & "
+            '"%delegatePython%" %delegatePrefix% -X utf8 "%~dp0delegate-workers-entry.py" %*\r\n'
+        ).encode("ascii")
+    ending = "\r\nexit /b %errorlevel%\r\n"
     return (
         "@echo off\r\n"
         "rem Managed by Delegate Workers\r\n"

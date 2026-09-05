@@ -195,7 +195,8 @@ class Installation:
                 content = launcher.read_bytes()
                 known = [self.launcher_content(launcher)]
                 if platform_support.WINDOWS and launcher.suffix == ".cmd":
-                    known.append(platform_support.windows_batch_launcher(legacy=True))
+                    legacy = platform_support.windows_batch_launcher(legacy=True)
+                    known.extend((legacy, legacy.replace(b"\r\nexit /b %errorlevel%\r\n", b" & exit /b\r\n")))
                 if content not in known:
                     raise ManagementError(f"命令入口被修改过或存在同名程序，未进行覆盖：{launcher}")
 
