@@ -9,8 +9,9 @@ Keep the main conversation's model and reasoning effort exactly as selected in
 Codex. This skill provides execution model presets, not a scheduling policy.
 
 Read [workers.json](workers.json), or run
-`python3 <skill-dir>/scripts/workers.py show`, where `<skill-dir>` is this file's
-directory. A user-supplied config can be read with `--config PATH` before `show`.
+`<python> <skill-dir>/scripts/workers.py show`, where `<skill-dir>` is this file's
+directory. Use `python3` on Linux/macOS, or `py -3` (or `python`) on Windows.
+A user-supplied config can be read with `--config PATH` before `show`.
 For a selected preset, `resolve --profile NAME` returns its model and effort.
 The default preset is the user's preferred starting point; other presets are
 available when their capabilities better fit the work. These are preferences,

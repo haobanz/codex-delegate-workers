@@ -13,7 +13,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "skills/delegate-workers/scripts/workers.py"
 SPEC = importlib.util.spec_from_file_location("workers", SCRIPT)
 workers = importlib.util.module_from_spec(SPEC)
+sys.path.insert(0, str(SCRIPT.parent))
 SPEC.loader.exec_module(workers)
+sys.path.pop(0)
 
 
 class WorkerTests(unittest.TestCase):
@@ -74,7 +76,7 @@ class WorkerTests(unittest.TestCase):
             session.write_bytes(original)
             result = subprocess.run([sys.executable, str(SCRIPT), "resolve"], cwd=root,
                                     env={**os.environ, "CODEX_HOME": str(root)},
-                                    capture_output=True, text=True, check=True)
+                                    capture_output=True, text=True, encoding="utf-8", check=True)
             self.assertEqual(json.loads(result.stdout)["worker_request"]["model"], "gpt-5.6-luna")
             self.assertEqual(session.read_bytes(), original)
 
@@ -85,7 +87,7 @@ class WorkerTests(unittest.TestCase):
                 with self.subTest(content=content):
                     path.write_text(content, encoding="utf-8")
                     result = subprocess.run([sys.executable, str(SCRIPT), "--config", str(path), "show"],
-                                            capture_output=True, text=True)
+                                            capture_output=True, text=True, encoding="utf-8")
                     self.assertEqual(result.returncode, 2)
                     self.assertIn("error", json.loads(result.stderr))
 

@@ -4,7 +4,6 @@
 import argparse
 import contextlib
 import copy
-import fcntl
 import hashlib
 import json
 import os
@@ -19,13 +18,14 @@ from uuid import uuid4
 
 import workers
 import activation
+import platform_support
 
 
 PROJECT = "delegate-workers"
 REPOSITORY = "https://github.com/haobanz/codex-delegate-workers.git"
 RECEIPT = ".delegate-workers-install.json"
 REQUIRED = {"SKILL.md", "workers.json", "VERSION", "scripts/workers.py", "scripts/manage.py"}
-RUNTIME_REQUIRED = {"scripts/activation.py", "references/default-delegation.md"}
+RUNTIME_REQUIRED = {"scripts/activation.py", "scripts/platform_support.py", "references/default-delegation.md"}
 EFFORT_LABELS = {"low": "低", "medium": "中", "high": "高", "xhigh": "超高",
                  "max": "最大", "ultra": "极限", "minimal": "最低", "none": "关闭"}
 
@@ -75,8 +75,8 @@ def validate_staged_candidate(stage, managed_files):
     for path in python_files:
         try:
             validation = subprocess.run(
-                [sys.executable, "-m", "py_compile", str(path)],
-                capture_output=True, text=True, check=False, timeout=30)
+                [sys.executable, "-X", "utf8", "-m", "py_compile", str(path)],
+                capture_output=True, text=True, encoding="utf-8", check=False, timeout=30)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ManagementError(f"新版本 Python 脚本检查失败，已停止更新：{path.relative_to(stage)}") from exc
         if validation.returncode:
@@ -86,8 +86,8 @@ def validate_staged_candidate(stage, managed_files):
 
     try:
         startup = subprocess.run(
-            [sys.executable, str(stage / "scripts/manage.py"), "--help"],
-            capture_output=True, text=True, check=False, timeout=30)
+            [sys.executable, "-X", "utf8", str(stage / "scripts/manage.py"), "--help"],
+            capture_output=True, text=True, encoding="utf-8", check=False, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ManagementError("新版本管理入口无法启动，已停止更新") from exc
     if startup.returncode:
@@ -115,9 +115,11 @@ def load_receipt(directory):
         raise ManagementError(f"安装记录中的命令目录无效：{receipt_path}")
     if "activation" in value:
         activation.validate_state(value["activation"])
+    if "path_entry_added" in value and type(value["path_entry_added"]) is not bool:
+        raise ManagementError("安装记录中的 PATH 所有权标记无效")
     for relative, digest in value["files"].items():
         path = PurePosixPath(relative)
-        if (not relative or path.is_absolute() or ".." in path.parts or "\\" in relative
+        if (not relative or path.is_absolute() or ".." in path.parts or "\\" in relative or ":" in relative
                 or relative in {RECEIPT, "workers.json"} or not isinstance(digest, str)):
             raise ManagementError(f"安装记录中的文件路径无效：{relative}")
     return value
@@ -127,47 +129,60 @@ class Installation:
     def __init__(self, codex_home, bin_dir=None):
         self.home = Path(codex_home).expanduser().resolve()
         self.skill = self.home / "skills" / PROJECT
-        self.launcher = self.home / "bin" / PROJECT
+        self.launcher = self.home / "bin" / (PROJECT + (".cmd" if platform_support.WINDOWS else ""))
         self.backups = self.home / "delegate-workers-backups"
         receipt = load_receipt(self.skill)
         saved_bin = receipt.get("command_dir") if receipt else None
         user_codex = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser().resolve()
-        default_bin = Path.home() / ".local/bin" if self.home == user_codex else self.home / "bin"
+        default_bin = platform_support.default_bin() if self.home == user_codex else self.home / "bin"
+        self.manage_user_path = platform_support.WINDOWS and (
+            self.home == user_codex or bool(receipt and receipt.get("path_entry_added")))
         self.command_dir = Path(bin_dir or saved_bin or default_bin).expanduser().resolve()
         if saved_bin and self.command_dir != Path(saved_bin):
             raise ManagementError("已安装版本的命令目录不能直接更改，请先卸载再选择新目录")
 
     def launchers(self):
-        return list(dict.fromkeys((self.launcher, self.command_dir / "dw", self.command_dir / PROJECT)))
+        suffix = ".cmd" if platform_support.WINDOWS else ""
+        paths = [self.launcher, self.command_dir / ("dw" + suffix), self.command_dir / (PROJECT + suffix)]
+        if platform_support.WINDOWS:
+            paths += [directory / "delegate-workers-entry.py" for directory in (self.launcher.parent, self.command_dir)]
+        return list(dict.fromkeys(paths))
 
     def menu_command(self):
         executable = shutil.which("dw")
-        if executable and Path(executable).resolve() == self.command_dir / "dw":
+        target = self.command_dir / ("dw.cmd" if platform_support.WINDOWS else "dw")
+        if executable and Path(executable).resolve() == target:
             return "dw"
-        return shlex.quote(str(self.command_dir / "dw"))
+        if platform_support.WINDOWS:
+            return "& '" + str(target).replace("'", "''") + "'"
+        return shlex.quote(str(target))
 
     def print_commands(self):
         print(f"\n打开菜单：{self.menu_command()}")
         print(f"一键更新：{self.menu_command()} update")
         path_dirs = [Path(part).expanduser().resolve() for part in os.get_exec_path() if part]
         if self.command_dir not in path_dirs:
-            print("请在 Shell 配置中添加下面一行，让终端能找到短命令：")
-            print(f'export PATH={shlex.quote(str(self.command_dir))}:"$PATH"')
+            if platform_support.WINDOWS:
+                print("当前 PowerShell 窗口可运行下面一行，或重新打开终端：")
+                print("$env:Path = '" + str(self.command_dir).replace("'", "''") + ";' + $env:Path")
+            else:
+                print("请在 Shell 配置中添加下面一行，让终端能找到短命令：")
+                print(f'export PATH={shlex.quote(str(self.command_dir))}:"$PATH"')
 
     @contextlib.contextmanager
     def locked(self):
         self.home.mkdir(parents=True, exist_ok=True)
-        with (self.home / ".delegate-workers.lock").open("a") as lock:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise ManagementError("另一个安装或设置操作正在运行，请稍后重试") from exc
-            try:
+        try:
+            with platform_support.file_lock(self.home / ".delegate-workers.lock"):
                 yield
-            finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+        except BlockingIOError as exc:
+            raise ManagementError("另一个安装或设置操作正在运行，请稍后重试") from exc
 
-    def launcher_content(self):
+    def launcher_content(self, path=None):
+        if platform_support.WINDOWS:
+            if path is not None and path.suffix == ".py":
+                return platform_support.windows_python_launcher(self.skill / "scripts/manage.py", self.home)
+            return platform_support.windows_batch_launcher()
         command = " ".join(shlex.quote(part) for part in (
             "python3", str(self.skill / "scripts/manage.py"), "--codex-home", str(self.home)))
         return (f'#!/bin/sh\n# Managed by Delegate Workers\nexec {command} "$@"\n').encode()
@@ -176,18 +191,20 @@ class Installation:
         for launcher in self.launchers():
             if launcher.is_symlink():
                 raise ManagementError(f"命令入口是符号链接，未进行覆盖：{launcher}")
-            if launcher.exists() and launcher.read_bytes() != self.launcher_content():
+            if launcher.exists() and launcher.read_bytes() != self.launcher_content(launcher):
                 raise ManagementError(f"命令入口被修改过或存在同名程序，未进行覆盖：{launcher}")
 
     def write_launchers(self):
         for launcher in self.launchers():
-            atomic_write(launcher, self.launcher_content(), 0o755)
+            content = self.launcher_content(launcher)
+            if not launcher.exists() or launcher.read_bytes() != content:
+                atomic_write(launcher, content, 0o755)
 
     def restore_launchers(self, previous):
         for launcher, contents in previous.items():
             if contents is not None:
                 atomic_write(launcher, contents, 0o755)
-            elif launcher.is_file() and launcher.read_bytes() == self.launcher_content():
+            elif launcher.is_file() and launcher.read_bytes() == self.launcher_content(launcher):
                 launcher.unlink()
 
     def config(self):
@@ -203,6 +220,26 @@ class Installation:
         self.backups.mkdir(parents=True, exist_ok=True)
         name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid4().hex[:8]
         return self.backups / name
+
+    @contextlib.contextmanager
+    def user_path_transaction(self, receipt, *, remove=False):
+        if not self.manage_user_path:
+            yield False
+            return
+        before = platform_support.read_user_path()
+        value, value_type = before if before is not None else ("", 2)
+        owned = bool(receipt and receipt.get("path_entry_added"))
+        updated = platform_support.update_path(value, self.command_dir, remove=remove) if not remove or owned else value
+        after = (updated, value_type)
+        changed = updated != value
+        if changed:
+            platform_support.write_user_path(after)
+        try:
+            yield False if remove else owned or changed
+        except BaseException:
+            if changed and platform_support.read_user_path() == after:
+                platform_support.write_user_path(before)
+            raise
 
     @contextlib.contextmanager
     def rules_transaction(self, edits):
@@ -284,8 +321,8 @@ class Installation:
             if not old:
                 shutil.copyfile(source / "workers.json", stage / "workers.json")
             validation = subprocess.run(
-                [sys.executable, str(stage / "scripts/workers.py"), "show"],
-                capture_output=True, text=True, check=False, timeout=30)
+                [sys.executable, "-X", "utf8", str(stage / "scripts/workers.py"), "show"],
+                capture_output=True, text=True, encoding="utf-8", check=False, timeout=30)
             if validation.returncode:
                 raise ManagementError("新版本无法读取当前执行配置，已停止更新：" + validation.stderr.strip())
             try:
@@ -301,21 +338,24 @@ class Installation:
             receipt = {"schema_version": 1, "project": PROJECT, "repository": REPOSITORY,
                        "version": version, "revision": revision, "files": files,
                        "command_dir": str(self.command_dir), "activation": activation_state}
-            atomic_write(stage / RECEIPT, json_bytes(receipt))
-            if old and old == receipt and not config_changed:
-                self.write_launchers()
-                return {"result": "unchanged", "version": version, "revision": revision}
-            with self.rules_transaction(rule_edits):
-                self.write_launchers()
-                if old:
-                    backup = self.backup_path()
-                    self.skill.rename(backup)
-                try:
-                    stage.rename(self.skill)
-                except BaseException:
-                    if backup is not None:
-                        backup.rename(self.skill)
-                    raise
+            with self.user_path_transaction(old) as path_owned:
+                if platform_support.WINDOWS:
+                    receipt["path_entry_added"] = path_owned
+                atomic_write(stage / RECEIPT, json_bytes(receipt))
+                if old and old == receipt and not config_changed:
+                    self.write_launchers()
+                    return {"result": "unchanged", "version": version, "revision": revision}
+                with self.rules_transaction(rule_edits):
+                    self.write_launchers()
+                    if old:
+                        backup = self.backup_path()
+                        self.skill.rename(backup)
+                    try:
+                        stage.rename(self.skill)
+                    except BaseException:
+                        if backup is not None:
+                            backup.rename(self.skill)
+                        raise
             return {"result": "updated" if old else "installed", "version": version,
                     "revision": revision, "backup": str(backup) if backup else None}
         except BaseException:
@@ -405,7 +445,7 @@ class Installation:
             self.check_launcher()
             old_launchers = {path: path.read_bytes() if path.exists() else None for path in self.launchers()}
             backup = self.backup_path()
-            with self.rules_transaction(rule_edits):
+            with self.user_path_transaction(receipt, remove=True), self.rules_transaction(rule_edits):
                 self.skill.rename(backup)
                 try:
                     for launcher in self.launchers():
@@ -420,7 +460,7 @@ class Installation:
 
 def run_git(arguments):
     try:
-        result = subprocess.run(["git", *arguments], capture_output=True, text=True, timeout=120)
+        result = subprocess.run(["git", *arguments], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ManagementError(f"Git 操作失败，请检查网络和 Git 是否可用：{exc}") from exc
     if result.returncode:
@@ -432,7 +472,7 @@ def revision_of(root):
     if not (root / ".git").exists():
         return "local"
     result = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "--quiet", "HEAD"],
-                            capture_output=True, text=True, timeout=30)
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
     if result.returncode == 1:
         return "local"
     if result.returncode:
@@ -519,7 +559,7 @@ def prompt(stream, label, default=None):
 def menu(installation, source=None, stream=None):
     if stream is None:
         try:
-            with open("/dev/tty", "r", encoding="utf-8") as terminal:
+            with open("CONIN$" if platform_support.WINDOWS else "/dev/tty", "r", encoding="utf-8") as terminal:
                 return menu(installation, source, terminal)
         except OSError as exc:
             if sys.stdin.isatty():
@@ -580,6 +620,7 @@ def menu(installation, source=None, stream=None):
 
 
 def main(argv=None):
+    platform_support.configure_console()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--codex-home", type=Path,
                         default=Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex"))

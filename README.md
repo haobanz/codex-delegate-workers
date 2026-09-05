@@ -10,18 +10,26 @@
 
 ## 环境要求
 
-- Linux、macOS 或 WSL。
-- Python 3.10 或更高版本、Git；在线一键安装还需要 curl。
+- Linux、macOS、WSL，或原生 Windows（PowerShell 5.1 / PowerShell 7 / CMD）。
+- Python 3.10 或更高版本、Git；Linux/macOS 在线安装还需要 curl。Windows 支持 `py -3` 或 `python`。
 - 已安装并登录 Codex。执行时需要当前 Codex 环境支持显式指定子代理模型和思考强度。
 - 不需要另外配置 OpenAI API Key，也没有 Python 第三方依赖。
 
 ## 一键安装
 
-公开仓库可直接运行：
+Linux、macOS、WSL：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/haobanz/codex-delegate-workers/main/install.sh | bash
 ```
+
+原生 Windows，在 PowerShell 中运行：
+
+```powershell
+irm https://raw.githubusercontent.com/haobanz/codex-delegate-workers/main/install.ps1 | iex
+```
+
+Windows 不需要管理员权限。安装器会添加用户级 PATH，PowerShell 安装脚本也会更新当前窗口的 PATH。安装后可直接运行 `dw`；CMD 用户安装后重新打开命令行窗口即可。
 
 安装完成后，直接输入两个字母打开设置菜单：
 
@@ -115,11 +123,10 @@ curl -fsSL https://raw.githubusercontent.com/haobanz/codex-delegate-workers/main
 
 ## 非交互设置
 
-更改默认执行模型与强度：
+更改默认执行模型与强度（各系统通用）：
 
 ```bash
-dw configure \
-  --profile default --model gpt-5.6-luna --effort high
+dw configure --profile default --model gpt-5.6-luna --effort high
 ```
 
 设置一个备选模型预设：
@@ -146,9 +153,11 @@ dw uninstall --yes
 
 卸载移除本项目的 Skill、启动器及默认委派规则段，并保留可恢复的备份。不会删除其他 Skill、个人指令、项目文件或 Codex 主代理配置。
 
+Windows 卸载还会移除本安装器添加的用户 PATH 条目；原本就存在的条目不会删除。
+
 ## 安装位置
 
-默认使用 `~/.codex`；如果设置了 `CODEX_HOME`，使用该路径。
+技能默认使用 `~/.codex`，Windows 对应 `%USERPROFILE%\.codex`；如果设置了 `CODEX_HOME`，使用该路径。以下是 Linux/macOS 的目录：
 
 ```text
 ~/.local/bin/
@@ -174,12 +183,28 @@ export PATH="$HOME/.local/bin:$PATH"
 
 通过 `--codex-home` 指定隔离安装目录时，命令默认放在该目录的 `bin` 中；可以用 `--bin-dir PATH` 明确指定短命令位置。
 
+Windows 短命令默认位于 `%LOCALAPPDATA%\Programs\DelegateWorkers\bin`，包含 `dw.cmd`、`delegate-workers.cmd` 和 Python 入口文件。中文界面使用 UTF-8，安装路径可以包含空格和中文。隔离安装不会修改用户 PATH。
+
 ## 本地开发与测试
 
 从源码安装：
 
 ```bash
 python3 skills/delegate-workers/scripts/manage.py --source . install
+```
+
+Windows 从源码安装：
+
+```powershell
+.\install.ps1 -Source .
+```
+
+Windows 隔离安装及测试：
+
+```powershell
+.\install.ps1 -Source . -CodexHome "$env:TEMP\delegate-workers-demo" -NoPath
+py -3 -X utf8 -m unittest discover -s tests -v
+.\tests\windows_bootstrap.ps1
 ```
 
 隔离安装测试：
@@ -199,5 +224,7 @@ python3 skills/delegate-workers/scripts/workers.py validate
 ```
 
 模型预设工具用法见 [配置参考](docs/configuration.md)。工具只读取和保存模型参数，不接管主代理的规划和调度。
+
+CI 覆盖 Linux、macOS、Windows 的 Python 3.10 / 3.13；Windows 还分别运行 PowerShell 5.1 和 7 的安装、设置、更新、卸载测试。具体执行结果见仓库 Actions。
 
 本项目为独立实现，现有社区项目仅作为设计参考，没有安装或引入其代码。Codex 原生能力参考：[Skills](https://learn.chatgpt.com/docs/build-skills)、[Subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents)。

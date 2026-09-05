@@ -7,6 +7,8 @@ import re
 import sys
 from pathlib import Path
 
+import platform_support
+
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "workers.json"
 EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
@@ -96,6 +98,7 @@ def resolve(config, *, profile=None, model=None, effort=None):
 
 
 def main(argv=None):
+    platform_support.configure_console()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     commands = parser.add_subparsers(dest="command", required=True)

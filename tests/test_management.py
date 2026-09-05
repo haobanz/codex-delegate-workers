@@ -41,6 +41,9 @@ class ManagementTests(unittest.TestCase):
         self.installation = manage.Installation(self.home)
         self.source_version = (self.source_skill / "VERSION").read_text().strip()
 
+    def short_command(self, directory=None):
+        return (directory or self.installation.command_dir) / ("dw.cmd" if os.name == "nt" else "dw")
+
     def tearDown(self):
         self.assertEqual(self.main_config.read_bytes(), self.main_bytes)
         self.assertEqual(self.other_skill.read_text(), "unrelated skill")
@@ -71,7 +74,7 @@ class ManagementTests(unittest.TestCase):
         self.assertFalse(self.installation.backups.exists())
         self.assertEqual(self.installation.status()["local_code_changes"], [])
         result = subprocess.run([str(self.installation.launcher), "status"], cwd=self.root,
-                                capture_output=True, text=True, check=True)
+                                capture_output=True, text=True, encoding="utf-8", check=True)
         self.assertTrue(json.loads(result.stdout)["installed"])
 
     def test_local_install_supports_a_repository_without_commits(self):
@@ -250,7 +253,7 @@ class ManagementTests(unittest.TestCase):
         result = self.installation.uninstall()
         self.assertFalse(self.installation.skill.exists())
         self.assertFalse(self.installation.launcher.exists())
-        self.assertFalse((self.installation.command_dir / "dw").exists())
+        self.assertFalse(self.short_command().exists())
         self.assertTrue((Path(result["backup"]) / "workers.json").is_file())
         self.installation.rollback()
         self.assertTrue(self.installation.skill.exists())
@@ -288,8 +291,9 @@ class ManagementTests(unittest.TestCase):
     def test_short_command_runs_from_path(self):
         self.install()
         environment = {**os.environ, "PATH": str(self.installation.command_dir) + os.pathsep + os.environ["PATH"]}
-        result = subprocess.run(["dw", "status"], env=environment, cwd=self.root,
-                                capture_output=True, text=True, check=True)
+        command = shutil.which("dw", path=environment["PATH"])
+        result = subprocess.run([command, "status"], env=environment, cwd=self.root,
+                                capture_output=True, text=True, encoding="utf-8", check=True)
         self.assertTrue(json.loads(result.stdout)["installed"])
         self.assertEqual(json.loads(result.stdout)["menu_command"], "dw")
 
@@ -326,12 +330,13 @@ class ManagementTests(unittest.TestCase):
         commands = self.root / "user bin"
         self.installation = manage.Installation(self.home, commands)
         self.install()
-        result = subprocess.run([str(commands / "dw"), "status"], capture_output=True, text=True, check=True)
+        result = subprocess.run([str(self.short_command(commands)), "status"], capture_output=True,
+                                text=True, encoding="utf-8", check=True)
         self.assertEqual(json.loads(result.stdout)["command_dir"], str(commands))
-        self.assertTrue((commands / "delegate-workers").exists())
+        self.assertTrue((commands / ("delegate-workers.cmd" if os.name == "nt" else "delegate-workers")).exists())
 
     def test_short_name_conflict_preserves_existing_command(self):
-        command = self.installation.command_dir / "dw"
+        command = self.short_command()
         command.parent.mkdir(parents=True)
         command.write_text("another tool", encoding="utf-8")
         with self.assertRaises(manage.ManagementError):
@@ -345,15 +350,17 @@ class ManagementTests(unittest.TestCase):
         receipt = json.loads(receipt_path.read_text())
         receipt.pop("command_dir")
         receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
-        (self.installation.command_dir / "dw").unlink()
+        self.short_command().unlink()
         self.installation = manage.Installation(self.home)
         self.install()
-        self.assertTrue((self.installation.command_dir / "dw").is_file())
+        self.assertTrue(self.short_command().is_file())
 
     def test_user_install_defaults_to_local_bin(self):
-        with patch.object(Path, "home", return_value=self.root), patch.dict(os.environ, {"CODEX_HOME": ""}):
+        with patch.object(Path, "home", return_value=self.root), \
+                patch.dict(os.environ, {"CODEX_HOME": "", "LOCALAPPDATA": str(self.root / "AppData/Local")}):
             installation = manage.Installation(self.root / ".codex")
-        self.assertEqual(installation.command_dir, self.root / ".local/bin")
+        expected = self.root / ("AppData/Local/Programs/DelegateWorkers/bin" if os.name == "nt" else ".local/bin")
+        self.assertEqual(installation.command_dir, expected)
 
     def test_install_enables_default_delegation(self):
         self.install()
@@ -517,6 +524,31 @@ class ManagementTests(unittest.TestCase):
             self.install()
         self.assertEqual(path.read_bytes(), original)
         self.assertFalse(self.installation.skill.exists())
+
+    def test_windows_user_path_change_rolls_back_on_install_failure(self):
+        self.installation.manage_user_path = True
+        state = [(r"C:\ExistingTools", 2)]
+        with patch.object(manage.platform_support, "read_user_path", side_effect=lambda: state[0]), \
+                patch.object(manage.platform_support, "write_user_path", side_effect=lambda value: state.__setitem__(0, value)):
+            with self.assertRaises(OSError):
+                with self.installation.user_path_transaction(None) as owned:
+                    self.assertTrue(owned)
+                    self.assertIn(str(self.installation.command_dir), state[0][0])
+                    raise OSError("installation failed")
+        self.assertEqual(state[0], (r"C:\ExistingTools", 2))
+
+    def test_windows_uninstall_removes_only_owned_path_entry(self):
+        self.installation.manage_user_path = True
+        original = r"C:\ExistingTools"
+        state = [(original + ";" + str(self.installation.command_dir), 2)]
+        with patch.object(manage.platform_support, "read_user_path", side_effect=lambda: state[0]), \
+                patch.object(manage.platform_support, "write_user_path", side_effect=lambda value: state.__setitem__(0, value)):
+            with self.installation.user_path_transaction({"path_entry_added": False}, remove=True):
+                pass
+            self.assertIn(str(self.installation.command_dir), state[0][0])
+            with self.installation.user_path_transaction({"path_entry_added": True}, remove=True):
+                pass
+        self.assertEqual(state[0], (original, 2))
 
 
 if __name__ == "__main__":

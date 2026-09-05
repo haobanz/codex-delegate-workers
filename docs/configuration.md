@@ -17,6 +17,8 @@
 
 配置工具从它所在的技能目录读取 `workers.json`，也可显式指定另一份完整配置：
 
+下面示例使用 Linux/macOS 的 `python3`；Windows 使用 `py -3 -X utf8` 或 `python -X utf8` 替换。
+
 ```bash
 python3 skills/delegate-workers/scripts/workers.py show
 python3 skills/delegate-workers/scripts/workers.py resolve --profile complex
