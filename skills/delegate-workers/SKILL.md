@@ -15,6 +15,14 @@ Worker models and reasoning levels come from [workers.json](workers.json), or a
 complete config file explicitly supplied by the user. Do not edit any Codex config
 or install agent roles as part of performing the user's task.
 
+The installer can enable a managed global startup rule that explicitly applies
+this skill before substantial implementation. With that rule active, do not wait
+for a skill mention or rely on description matching. The user's request and project
+instructions still determine scope. Assigned execution workers remain leaf agents.
+The `dw mode` command manages activation separately; never toggle it during an
+ordinary coding task. At dispatch time, briefly report the requested worker model
+and effort, or the concrete reason for doing the task in the main conversation.
+
 ## Select The Work And Worker
 
 Keep requirements, architecture decisions, task decomposition, and final acceptance

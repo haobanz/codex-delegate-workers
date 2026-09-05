@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath
 from uuid import uuid4
 
 import workers
+import activation
 
 
 PROJECT = "delegate-workers"
@@ -85,6 +86,8 @@ def load_receipt(directory):
     if "command_dir" in value and (not isinstance(value["command_dir"], str)
                                    or not Path(value["command_dir"]).is_absolute()):
         raise ManagementError(f"安装记录中的命令目录无效：{receipt_path}")
+    if "activation" in value:
+        activation.validate_state(value["activation"])
     for relative, digest in value["files"].items():
         path = PurePosixPath(relative)
         if (not relative or path.is_absolute() or ".." in path.parts or "\\" in relative
@@ -174,6 +177,32 @@ class Installation:
         name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ") + "-" + uuid4().hex[:8]
         return self.backups / name
 
+    @contextlib.contextmanager
+    def rules_transaction(self, edits):
+        changed = []
+        try:
+            for path, (before, after) in edits.items():
+                if activation.read_file(path) != before:
+                    raise ManagementError(f"指令文件在操作期间发生变化，请重试：{path}")
+                if before is not None:
+                    backup = self.backup_path()
+                    backup.mkdir()
+                    atomic_write(backup / path.name, before)
+                mode = path.stat().st_mode & 0o777 if before is not None else 0o644
+                if after is None:
+                    path.unlink()
+                else:
+                    atomic_write(path, after, mode)
+                changed.append((path, before, mode))
+            yield
+        except BaseException:
+            for path, before, mode in reversed(changed):
+                if before is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    atomic_write(path, before, mode)
+            raise
+
     def apply(self, source, revision="local", source_files=None):
         """Stage and validate the candidate before swapping the installed directory."""
         source = Path(source).resolve()
@@ -191,6 +220,16 @@ class Installation:
         if not version or len(version) > 64:
             raise ManagementError("版本号无效")
         old = load_receipt(self.skill)
+        previous_activation = old.get("activation") if old else None
+        requested_mode = (previous_activation or {"mode": "auto"})["mode"]
+        if old is None and (source / RECEIPT).is_file():
+            restored_receipt = load_receipt(source)
+            requested_mode = (restored_receipt.get("activation") or {"mode": "auto"})["mode"]
+        template_path = source / "references/default-delegation.md"
+        template = template_path.read_text(encoding="utf-8") if template_path.is_file() else None
+        activation_state, rule_edits = activation.plan(
+            self.home, self.skill, previous_activation,
+            requested_mode if template is not None else "on-demand", template)
         self.check_launcher()
         if old:
             changes = self.changed_files(old)
@@ -223,21 +262,22 @@ class Installation:
                 raise ManagementError("新版本无法读取当前执行配置，已停止更新：" + validation.stderr.strip())
             receipt = {"schema_version": 1, "project": PROJECT, "repository": REPOSITORY,
                        "version": version, "revision": revision, "files": files,
-                       "command_dir": str(self.command_dir)}
+                       "command_dir": str(self.command_dir), "activation": activation_state}
             atomic_write(stage / RECEIPT, json_bytes(receipt))
             if old and old == receipt:
                 self.write_launchers()
                 return {"result": "unchanged", "version": version, "revision": revision}
-            self.write_launchers()
-            if old:
-                backup = self.backup_path()
-                self.skill.rename(backup)
-            try:
-                stage.rename(self.skill)
-            except BaseException:
-                if backup is not None:
-                    backup.rename(self.skill)
-                raise
+            with self.rules_transaction(rule_edits):
+                self.write_launchers()
+                if old:
+                    backup = self.backup_path()
+                    self.skill.rename(backup)
+                try:
+                    stage.rename(self.skill)
+                except BaseException:
+                    if backup is not None:
+                        backup.rename(self.skill)
+                    raise
             return {"result": "updated" if old else "installed", "version": version,
                     "revision": revision, "backup": str(backup) if backup else None}
         except BaseException:
@@ -295,6 +335,20 @@ class Installation:
             self.save_config(config)
             return config
 
+    def set_mode(self, mode):
+        with self.locked():
+            receipt = load_receipt(self.skill)
+            if receipt is None:
+                raise ManagementError("请先安装本技能")
+            template_path = self.skill / "references/default-delegation.md"
+            template = template_path.read_text(encoding="utf-8") if template_path.is_file() else None
+            state, edits = activation.plan(self.home, self.skill, receipt.get("activation"), mode,
+                                           template, repair=True)
+            receipt["activation"] = state
+            with self.rules_transaction(edits):
+                atomic_write(self.skill / RECEIPT, json_bytes(receipt))
+            return {"activation": activation.status(self.home, state)}
+
     def status(self):
         receipt = load_receipt(self.skill)
         if receipt is None:
@@ -303,6 +357,7 @@ class Installation:
                 "skill": str(self.skill), "launcher": str(self.launcher),
                 "command_dir": str(self.command_dir), "menu_command": self.menu_command(),
                 "local_code_changes": self.changed_files(receipt), "config": self.config(),
+                "activation": activation.status(self.home, receipt.get("activation")),
                 "main_session": "unchanged"}
 
     def rollback(self):
@@ -316,20 +371,24 @@ class Installation:
 
     def uninstall(self):
         with self.locked():
-            if load_receipt(self.skill) is None:
+            receipt = load_receipt(self.skill)
+            if receipt is None:
                 return {"result": "not_installed"}
+            _, rule_edits = activation.plan(self.home, self.skill, receipt.get("activation"), "on-demand",
+                                            repair=True)
             self.check_launcher()
             old_launchers = {path: path.read_bytes() if path.exists() else None for path in self.launchers()}
             backup = self.backup_path()
-            self.skill.rename(backup)
-            try:
-                for launcher in self.launchers():
-                    if launcher.exists():
-                        launcher.unlink()
-            except BaseException:
-                backup.rename(self.skill)
-                self.restore_launchers(old_launchers)
-                raise
+            with self.rules_transaction(rule_edits):
+                self.skill.rename(backup)
+                try:
+                    for launcher in self.launchers():
+                        if launcher.exists():
+                            launcher.unlink()
+                except BaseException:
+                    backup.rename(self.skill)
+                    self.restore_launchers(old_launchers)
+                    raise
             return {"result": "uninstalled", "backup": str(backup)}
 
 
@@ -371,6 +430,16 @@ def print_config(config):
         print(f"    后备角色：{profile_label(profile['fallback']) if profile.get('fallback') else '无'}")
 
 
+def print_activation(state):
+    print(f"默认委派：{'开启' if state['mode'] == 'auto' else '关闭（按需匹配）'}")
+    if state.get("file"):
+        print(f"启动规则：{state['file']}")
+    if state.get("issue"):
+        print(f"规则检查：{state['issue']}")
+    elif state["mode"] == "auto":
+        print("规则检查：已写入，新 Codex 会话加载后生效")
+
+
 def print_result(value, *, human=False):
     if not human:
         print(json.dumps(value, indent=2, ensure_ascii=False))
@@ -381,11 +450,15 @@ def print_result(value, *, human=False):
         if not value["installed"]:
             return
         print(f"当前版本：{value['version']}")
+        print_activation(value["activation"])
         print(f"提交编号：{value['revision']}")
         changes = value["local_code_changes"]
         print(f"代码检查：{'存在本地修改：' + ', '.join(changes) if changes else '正常'}")
         print_config(value["config"])
         print("\n主代理模型和思考强度：沿用当前 Codex 会话设置")
+    elif "activation" in value:
+        print_activation(value["activation"])
+        print("请重新启动 Codex 会话以加载新的启动规则。")
     elif "profiles" in value:
         print_config(value)
         print("\n执行配置已保存。")
@@ -437,9 +510,13 @@ def menu(installation, source=None, stream=None):
                 return menu(installation, source, sys.stdin)
             raise ManagementError("菜单需要交互式终端；脚本中请使用 install、update、configure 或 status 命令") from exc
     while True:
+        receipt = load_receipt(installation.skill)
+        if receipt:
+            print_activation(activation.status(installation.home, receipt.get("activation")))
         print("\n执行子代理管理\n"
               "1. 安装 / 更新\n2. 设置执行模型和思考强度\n3. 设置并发数和尝试次数\n"
-              "4. 查看状态和当前设置\n5. 回滚版本（保留执行设置）\n6. 卸载\n0. 退出")
+              "4. 查看状态和当前设置\n5. 回滚版本（保留执行设置）\n6. 卸载\n"
+              "7. 开启 / 关闭默认委派\n0. 退出")
         try:
             choice = prompt(stream, "请选择", "0")
             if choice == "0":
@@ -479,8 +556,17 @@ def menu(installation, source=None, stream=None):
                 if prompt(stream, "输入“卸载”确认移除本技能，其他输入取消") in {"卸载", "uninstall"}:
                     print_result(installation.uninstall(), human=True)
                     return
+            elif choice == "7":
+                current = installation.status()
+                if not current["installed"]:
+                    raise ManagementError("请先选择菜单 1 安装本技能")
+                print_activation(current["activation"])
+                answer = prompt(stream, "默认委派：1 开启，2 关闭", "1" if current["activation"]["mode"] == "auto" else "2")
+                if answer not in {"1", "2"}:
+                    raise ManagementError("请输入 1 或 2")
+                print_result(installation.set_mode("auto" if answer == "1" else "on-demand"), human=True)
             else:
-                print("请输入 0 到 6 的菜单编号。")
+                print("请输入 0 到 7 的菜单编号。")
         except EOFError:
             return
         except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
@@ -505,6 +591,8 @@ def main(argv=None):
     limits = commands.add_parser("limits")
     limits.add_argument("--parallel", type=int)
     limits.add_argument("--attempts", type=int)
+    mode = commands.add_parser("mode", help="开启或关闭默认委派")
+    mode.add_argument("value", choices=["auto", "on-demand"])
     uninstall = commands.add_parser("uninstall")
     uninstall.add_argument("--yes", action="store_true")
     args = parser.parse_args(argv)
@@ -519,6 +607,8 @@ def main(argv=None):
             output = installation.configure(args.profile, args.model, args.effort, args.fallback, args.default)
         elif args.command == "limits":
             output = installation.set_limits(args.parallel, args.attempts)
+        elif args.command == "mode":
+            output = installation.set_mode(args.value)
         elif args.command == "rollback":
             output = installation.rollback()
         elif args.command == "uninstall":
@@ -530,7 +620,7 @@ def main(argv=None):
         print_result(output, human=sys.stdout.isatty())
         if args.command in {"install", "update", "rollback"}:
             installation.print_commands()
-            print("请新建 Codex 任务，然后输入 $delegate-workers 和你的需求。")
+            print("请重新启动 Codex 会话以加载技能及默认委派规则。")
         return 0
     except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
         print(f"操作失败：{exc}", file=sys.stderr)

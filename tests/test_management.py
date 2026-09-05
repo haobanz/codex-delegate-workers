@@ -48,7 +48,7 @@ class ManagementTests(unittest.TestCase):
     def install(self):
         return self.installation.install(self.source)
 
-    def release(self, version="0.2.0"):
+    def release(self, version="9.9.9"):
         (self.source_skill / "VERSION").write_text(version + "\n", encoding="utf-8")
 
     def test_install_and_reinstall_are_idempotent(self):
@@ -287,6 +287,141 @@ class ManagementTests(unittest.TestCase):
         with patch.object(Path, "home", return_value=self.root), patch.dict(os.environ, {"CODEX_HOME": ""}):
             installation = manage.Installation(self.root / ".codex")
         self.assertEqual(installation.command_dir, self.root / ".local/bin")
+
+    def test_install_enables_default_delegation(self):
+        self.install()
+        state = self.installation.status()["activation"]
+        self.assertEqual(state["mode"], "auto")
+        self.assertTrue(state["rule_present"])
+        self.assertIn(str(self.installation.skill / "SKILL.md").encode(),
+                      (self.home / "AGENTS.md").read_bytes())
+
+    def test_turn_off_restores_exact_existing_instructions(self):
+        path = self.home / "AGENTS.md"
+        original = b"# Personal rules\r\nPreserve these bytes without a trailing newline."
+        path.write_bytes(original)
+        self.install()
+        self.installation.set_mode("on-demand")
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.installation.status()["activation"]["mode"], "on-demand")
+        self.release()
+        self.install()
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual(self.installation.status()["activation"]["mode"], "on-demand")
+
+    def test_uninstall_then_restore_preserves_disabled_mode(self):
+        self.install()
+        self.installation.set_mode("on-demand")
+        self.installation.uninstall()
+        self.installation.rollback()
+        self.assertEqual(self.installation.status()["activation"]["mode"], "on-demand")
+        self.assertFalse((self.home / "AGENTS.md").exists())
+
+    def test_disable_removes_only_created_file_and_keeps_later_user_edits(self):
+        self.install()
+        path = self.home / "AGENTS.md"
+        self.installation.set_mode("on-demand")
+        self.assertFalse(path.exists())
+        self.installation.set_mode("auto")
+        with path.open("ab") as stream:
+            stream.write(b"# Added after installation\n")
+        self.installation.uninstall()
+        self.assertEqual(path.read_bytes(), b"# Added after installation\n")
+
+    def test_existing_override_is_used_and_restored(self):
+        base = self.home / "AGENTS.md"
+        override = self.home / "AGENTS.override.md"
+        base.write_bytes(b"# Base rules\n")
+        override.write_bytes(b"# Active override\n")
+        self.install()
+        self.assertEqual(self.installation.status()["activation"]["file"], str(override))
+        self.assertEqual(base.read_bytes(), b"# Base rules\n")
+        self.installation.uninstall()
+        self.assertEqual(override.read_bytes(), b"# Active override\n")
+
+    def test_later_override_is_reported_and_rule_can_migrate(self):
+        self.install()
+        override = self.home / "AGENTS.override.md"
+        override.write_bytes(b"# New override\n")
+        state = self.installation.status()["activation"]
+        self.assertFalse(state["rule_present"])
+        self.assertIsNotNone(state["issue"])
+        self.installation.set_mode("auto")
+        self.assertTrue(self.installation.status()["activation"]["rule_present"])
+        self.assertFalse((self.home / "AGENTS.md").exists())
+        self.installation.set_mode("on-demand")
+        self.assertEqual(override.read_bytes(), b"# New override\n")
+
+    def test_changed_owned_rule_is_not_overwritten(self):
+        self.install()
+        path = self.home / "AGENTS.md"
+        path.write_bytes(path.read_bytes().replace(b"Default Worker Delegation", b"User changed this block"))
+        original = path.read_bytes()
+        self.assertFalse(self.installation.status()["activation"]["rule_present"])
+        with self.assertRaises(ValueError):
+            self.install()
+        with self.assertRaises(ValueError):
+            self.installation.set_mode("auto")
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_deleted_rule_is_detected_and_explicitly_repaired(self):
+        self.install()
+        path = self.home / "AGENTS.md"
+        path.unlink()
+        self.assertFalse(self.installation.status()["activation"]["rule_present"])
+        with self.assertRaises(ValueError):
+            self.install()
+        self.installation.set_mode("auto")
+        self.assertTrue(self.installation.status()["activation"]["rule_present"])
+
+    def test_failed_mode_save_restores_instruction_and_receipt(self):
+        self.install()
+        before = (self.home / "AGENTS.md").read_bytes()
+        receipt = (self.installation.skill / manage.RECEIPT).read_bytes()
+        original_write = manage.atomic_write
+
+        def fail_receipt(path, data, *args):
+            if path.name == manage.RECEIPT:
+                raise OSError("simulated receipt write failure")
+            return original_write(path, data, *args)
+
+        with patch.object(manage, "atomic_write", fail_receipt), self.assertRaises(OSError):
+            self.installation.set_mode("on-demand")
+        self.assertEqual((self.home / "AGENTS.md").read_bytes(), before)
+        self.assertEqual((self.installation.skill / manage.RECEIPT).read_bytes(), receipt)
+
+    def test_failed_update_restores_old_rule(self):
+        self.install()
+        path = self.home / "AGENTS.md"
+        original = path.read_bytes()
+        template = self.source_skill / "references/default-delegation.md"
+        template.write_text(template.read_text() + "\nNew rule revision.\n", encoding="utf-8")
+        rename = Path.rename
+
+        def fail_candidate(path, target):
+            if path.name.startswith(".delegate-workers-stage-"):
+                raise OSError("simulated swap failure")
+            return rename(path, target)
+
+        with patch.object(Path, "rename", fail_candidate), self.assertRaises(OSError):
+            self.install()
+        self.assertEqual(path.read_bytes(), original)
+        self.assertTrue(self.installation.status()["activation"]["rule_present"])
+
+    def test_mode_can_be_changed_from_menu(self):
+        self.install()
+        with contextlib.redirect_stdout(io.StringIO()):
+            manage.menu(self.installation, self.source, io.StringIO("7\n2\n0\n"))
+        self.assertEqual(self.installation.status()["activation"]["mode"], "on-demand")
+
+    def test_unknown_rule_block_is_not_adopted(self):
+        path = self.home / "AGENTS.md"
+        original = b"\n<!-- delegate-workers:begin -->\nUnknown rule\n<!-- delegate-workers:end -->\n"
+        path.write_bytes(original)
+        with self.assertRaises(ValueError):
+            self.install()
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse(self.installation.skill.exists())
 
 
 if __name__ == "__main__":

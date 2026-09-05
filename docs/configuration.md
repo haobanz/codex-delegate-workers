@@ -110,5 +110,11 @@ python3 -m unittest discover -s tests -v
 Tests cover worker selection, capability mismatches, bounded escalation, per-task
 overrides, concurrency, malformed configuration, and preservation of session config.
 
+Default delegation is a separate persistent setting managed by `dw mode auto` and
+`dw mode on-demand`. The installer defaults to `auto` and maintains one owned block
+in the effective global AGENTS file. Disabling it restores ordinary skill matching;
+it does not disable native subagent tools or change the main session model.
+The installation receipt stores this mode independently from worker profiles.
+
 The install/update menu is a separate user-invoked lifecycle tool. Invoking the
 execution skill does not authorize it to install or update itself during a task.
