@@ -19,19 +19,84 @@ from uuid import uuid4
 import workers
 import activation
 import platform_support
+import project_rules
 
 
 PROJECT = "delegate-workers"
 REPOSITORY = "https://github.com/haobanz/codex-delegate-workers.git"
 RECEIPT = ".delegate-workers-install.json"
 REQUIRED = {"SKILL.md", "workers.json", "VERSION", "scripts/workers.py", "scripts/manage.py"}
-RUNTIME_REQUIRED = {"scripts/activation.py", "scripts/platform_support.py", "references/default-delegation.md"}
+BASE_RUNTIME_REQUIRED = {"scripts/activation.py", "scripts/platform_support.py",
+                         "references/default-delegation.md"}
+CAPABILITY_RUNTIME_REQUIRED = {"scripts/capabilities.py", "model-capabilities.json"}
+PROJECT_RUNTIME_REQUIRED = {"scripts/project_rules.py", "references/project-delegation.md"}
+RUNTIME_REQUIRED = BASE_RUNTIME_REQUIRED | CAPABILITY_RUNTIME_REQUIRED | PROJECT_RUNTIME_REQUIRED
 EFFORT_LABELS = {"low": "低", "medium": "中", "high": "高", "xhigh": "超高",
                  "max": "最大", "ultra": "极限", "minimal": "最低", "none": "关闭"}
 
 
 class ManagementError(ValueError):
     pass
+
+
+def required_files_for_candidate(files):
+    """Require each newer runtime pair only when the candidate manifest adopts it."""
+    required = REQUIRED | BASE_RUNTIME_REQUIRED
+    if set(files) & CAPABILITY_RUNTIME_REQUIRED:
+        required |= CAPABILITY_RUNTIME_REQUIRED
+    if set(files) & PROJECT_RUNTIME_REQUIRED:
+        required |= PROJECT_RUNTIME_REQUIRED
+    return required
+
+
+def validate_worker_for_configuration(worker):
+    """Validate one new configuration without making compatibility a read barrier."""
+    try:
+        validator = workers.validate_worker
+    except AttributeError as exc:
+        raise ManagementError("当前 workers.py 缺少必要的 validate_worker 接口，未保存配置") from exc
+    result = validator(worker)
+    if not isinstance(result, dict):
+        raise workers.ConfigError("模型兼容性预检返回格式无效")
+    status = result.get("status")
+    if status == "incompatible":
+        raise workers.ConfigError(result.get("error") or "执行模型与思考强度不兼容")
+    if status not in {"compatible", "unverified"}:
+        raise workers.ConfigError("模型兼容性预检返回未知状态")
+    return result
+
+
+def worker_compatibility(worker):
+    """Return a diagnostic for one profile, keeping status readable on one failure."""
+    validator = getattr(workers, "validate_worker", None)
+    if validator is None:
+        return {"status": "error", "source": "管理器与 workers.py 接口不匹配",
+                "runtime_verified": False,
+                "error": "当前 workers.py 缺少必要的 validate_worker 接口"}
+    try:
+        result = validator(worker)
+    except workers.ConfigError as exc:
+        return {"status": "incompatible", "source": "静态兼容性预检",
+                "runtime_verified": False, "error": str(exc) or "执行模型与思考强度不兼容"}
+    except Exception as exc:
+        return {"status": "error", "source": "静态兼容性预检",
+                "runtime_verified": False,
+                "error": str(exc) or f"{type(exc).__name__}：兼容性预检失败"}
+    if not isinstance(result, dict):
+        return {"status": "error", "source": "静态兼容性预检", "runtime_verified": False,
+                "error": "模型兼容性预检返回格式无效"}
+    result = copy.deepcopy(result)
+    if result.get("status") not in {"compatible", "unverified"}:
+        result["status"] = "error"
+        result.setdefault("error", "模型兼容性预检返回未知状态")
+    result.setdefault("source", "静态兼容性预检")
+    # This command performs static checking only; it never verifies runtime identity.
+    result["runtime_verified"] = False
+    return result
+
+
+def compatibility_for_config(config):
+    return {name: worker_compatibility(profile) for name, profile in config["profiles"].items()}
 
 
 def file_hash(path):
@@ -278,7 +343,7 @@ class Installation:
         source = Path(source).resolve()
         present = inventory(source)
         files = present if source_files is None else source_files
-        required_files = REQUIRED | RUNTIME_REQUIRED
+        required_files = required_files_for_candidate(files)
         for relative in required_files:
             if not (source / relative).is_file():
                 raise ManagementError(f"新版本缺少必要文件：{relative}")
@@ -404,8 +469,10 @@ class Installation:
             config["profiles"][profile] = candidate
             if default:
                 config["default_profile"] = profile
-            self.save_config(config)
-            return config
+            normalized = workers.validate_config(config)
+            validate_worker_for_configuration(normalized["profiles"][profile])
+            self.save_config(normalized)
+            return normalized
 
     def set_mode(self, mode):
         with self.locked():
@@ -425,12 +492,65 @@ class Installation:
         receipt = load_receipt(self.skill)
         if receipt is None:
             return {"installed": False, "skill": str(self.skill)}
+        config = self.config()
         return {"installed": True, "version": receipt["version"], "revision": receipt["revision"],
                 "skill": str(self.skill), "launcher": str(self.launcher),
                 "command_dir": str(self.command_dir), "menu_command": self.menu_command(),
-                "local_code_changes": self.changed_files(receipt), "config": self.config(),
+                "local_code_changes": self.changed_files(receipt), "config": config,
+                "compatibility": compatibility_for_config(config),
                 "activation": activation.status(self.home, receipt.get("activation")),
                 "main_session": "unchanged"}
+
+    def project_init(self, path=None, profile=None, model=None, effort=None):
+        explicit = profile is not None or model is not None or effort is not None
+        if explicit:
+            # Validate option shape before creating the project lock. The final
+            # pair is resolved under that lock so an existing project snapshot
+            # cannot be replaced by the current global default accidentally.
+            if profile is not None and (not isinstance(profile, str)
+                                        or not workers.PROFILE_NAME.fullmatch(profile)):
+                raise workers.ConfigError("预设名称无效")
+            if model is not None:
+                workers.check_model(model)
+                if effort is None:
+                    raise workers.ConfigError("更改模型时请同时指定思考强度 --effort")
+            if effort is not None:
+                workers.check_effort(effort)
+
+            def selection_resolver(state):
+                config = self.config()
+                if state is not None and profile is None:
+                    candidate = dict(state["worker"])
+                    if model is not None:
+                        candidate["model"] = model
+                    if effort is not None:
+                        candidate["reasoning_effort"] = effort
+                    return state["selection"]["profile"], candidate
+                resolved = workers.resolve(config, profile=profile, model=model, effort=effort)
+                return resolved["profile"], resolved["worker_request"]
+
+            return project_rules.init_project(
+                path, template_path=self.skill / "references/project-delegation.md",
+                selection_resolver=selection_resolver)
+
+        def default_selection():
+            config = self.config()
+            resolved = workers.resolve(config)
+            return resolved["profile"], resolved["worker_request"]
+
+        return project_rules.init_project(
+            path, template_path=self.skill / "references/project-delegation.md",
+            default_selection=default_selection)
+
+    def project_sync(self, path=None):
+        return project_rules.sync_project(
+            path, template_path=self.skill / "references/project-delegation.md")
+
+    def project_status(self, path=None):
+        return project_rules.status_project(path)
+
+    def project_disable(self, path=None):
+        return project_rules.disable_project(path)
 
     def rollback(self):
         with self.locked():
@@ -499,6 +619,23 @@ def print_config(config):
         print(f"    思考强度：{EFFORT_LABELS.get(effort, effort)}（{effort}）")
 
 
+def print_compatibility(compatibility):
+    print("\n模型兼容性预检：")
+    labels = {"compatible": "兼容", "unverified": "未验证", "incompatible": "不兼容",
+              "error": "检查错误"}
+    for name, result in compatibility.items():
+        status = result.get("status", "error") if isinstance(result, dict) else "error"
+        label = labels.get(status, status)
+        details = []
+        if isinstance(result, dict) and result.get("source"):
+            details.append(f"来源：{result['source']}")
+        if isinstance(result, dict) and result.get("error"):
+            details.append(f"错误：{result['error']}")
+        if not isinstance(result, dict) or not result.get("runtime_verified", False):
+            details.append("运行时身份：未独立验证")
+        print(f"  {profile_label(name)}：{label}" + ("；" + "；".join(details) if details else ""))
+
+
 def print_activation(state):
     print(f"默认委派：{'开启' if state['mode'] == 'auto' else '关闭（按需匹配）'}")
     if state.get("file"):
@@ -509,11 +646,52 @@ def print_activation(state):
         print("规则检查：已写入，新 Codex 会话加载后生效")
 
 
+def print_project_status(value):
+    print(f"项目根目录：{value['project_root']}")
+    print(f"项目状态：{value['status']}")
+    print(f"状态文件：{value['state_file']}（{'存在' if value['state_present'] else '不存在'}）")
+    print(f"有效指令：{value['effective_file']}；文件存在：{'是' if value['file_present'] else '否'}")
+    print(f"完整性：{value['integrity']}")
+    if value.get("worker"):
+        worker = value["worker"]
+        print(f"项目执行模型：{worker['model']} / {worker['reasoning_effort']}")
+    for diagnostic in value.get("diagnostics", []):
+        print(f"诊断：{diagnostic}")
+    session_loaded = value.get("session_loaded")
+    session_label = "未验证" if session_loaded is None else ("是" if session_loaded else "否")
+    print(f"会话加载：{session_label}；运行时身份已验证：{value.get('runtime_verified', False)}")
+    print(f"操作建议：{value.get('action', '')}")
+
+
+def print_project_change(value):
+    labels = {"initialized": "项目委派已启用", "reenabled": "项目委派已重新启用",
+              "updated": "项目委派已更新", "synced": "项目委派已同步",
+              "disabled": "项目委派已禁用", "unchanged": "项目委派无需变化"}
+    print(labels.get(value.get("result"), value.get("result", "完成")))
+    print(f"项目根目录：{value.get('project_root')}")
+    if value.get("worker"):
+        worker = value["worker"]
+        print(f"项目执行模型：{worker['model']} / {worker['reasoning_effort']}")
+    compatibility = value.get("compatibility")
+    if isinstance(compatibility, dict):
+        if compatibility.get("warning"):
+            print(f"兼容性警告：{compatibility['warning']}")
+        if compatibility.get("error"):
+            print(f"兼容性诊断：{compatibility['error']}")
+    if value.get("backup"):
+        print(f"备份位置：{value['backup']}")
+    print("请重新启动或重新读取 Codex 任务以加载项目指令；当前工具不能确认活动会话已加载。")
+
+
 def print_result(value, *, human=False):
     if not human:
         print(json.dumps(value, indent=2, ensure_ascii=False))
         return
-    if "installed" in value:
+    if value.get("project") == "status":
+        print_project_status(value)
+    elif value.get("project") in {"init", "sync", "disable"}:
+        print_project_change(value)
+    elif "installed" in value:
         print(f"\n安装状态：{'已安装' if value['installed'] else '未安装'}")
         print(f"技能目录：{value['skill']}")
         if not value["installed"]:
@@ -524,6 +702,7 @@ def print_result(value, *, human=False):
         changes = value["local_code_changes"]
         print(f"代码检查：{'存在本地修改：' + ', '.join(changes) if changes else '正常'}")
         print_config(value["config"])
+        print_compatibility(value.get("compatibility", {}))
         print("\n主代理模型和思考强度：沿用当前 Codex 会话设置")
     elif "activation" in value:
         print_activation(value["activation"])
@@ -644,6 +823,19 @@ def main(argv=None):
     mode.add_argument("value", choices=["auto", "on-demand"])
     uninstall = commands.add_parser("uninstall")
     uninstall.add_argument("--yes", action="store_true")
+    project = commands.add_parser("project", help="管理当前项目的委派规则")
+    project_commands = project.add_subparsers(dest="project_command", required=True)
+    project_init = project_commands.add_parser("init", help="启用或重新配置项目委派")
+    project_init.add_argument("--path", type=Path)
+    project_init.add_argument("--profile")
+    project_init.add_argument("--model")
+    project_init.add_argument("--effort")
+    project_sync = project_commands.add_parser("sync", help="使用项目快照同步委派规则")
+    project_sync.add_argument("--path", type=Path)
+    project_status = project_commands.add_parser("status", help="查看项目委派状态（只读）")
+    project_status.add_argument("--path", type=Path)
+    project_disable = project_commands.add_parser("disable", help="禁用项目委派规则")
+    project_disable.add_argument("--path", type=Path)
     args = parser.parse_args(argv)
     try:
         installation = Installation(args.codex_home, args.bin_dir)
@@ -652,6 +844,15 @@ def main(argv=None):
             return 0
         if args.command in {"install", "update"}:
             output = installation.install(args.source, require_existing=args.command == "update")
+        elif args.command == "project":
+            if args.project_command == "init":
+                output = installation.project_init(args.path, args.profile, args.model, args.effort)
+            elif args.project_command == "sync":
+                output = installation.project_sync(args.path)
+            elif args.project_command == "status":
+                output = installation.project_status(args.path)
+            else:
+                output = installation.project_disable(args.path)
         elif args.command == "configure":
             output = installation.configure(args.profile, args.model, args.effort, default=args.default)
         elif args.command == "mode":

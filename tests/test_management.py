@@ -54,10 +54,17 @@ class ManagementTests(unittest.TestCase):
     def release(self, version="9.9.9"):
         (self.source_skill / "VERSION").write_text(version + "\n", encoding="utf-8")
 
+    def legacy_source(self):
+        legacy = self.root / "legacy-source"
+        shutil.copytree(ROOT / "tests/fixtures/pre-capability", legacy)
+        return legacy
+
     def installation_snapshot(self):
         paths = [
             self.installation.skill / manage.RECEIPT,
             self.installation.skill / "workers.json",
+            self.installation.skill / "scripts/capabilities.py",
+            self.installation.skill / "model-capabilities.json",
             self.home / "AGENTS.md",
             self.home / "AGENTS.override.md",
             *self.installation.launchers(),
@@ -111,6 +118,118 @@ class ManagementTests(unittest.TestCase):
                 operation()
             self.assertEqual((self.installation.skill / "workers.json").read_bytes(), previous)
 
+    def test_incompatible_candidate_is_rejected_before_config_or_backup_write(self):
+        self.install()
+        config_path = self.installation.skill / "workers.json"
+        backup_path = self.installation.skill / "workers.json.bak"
+        previous = config_path.read_bytes()
+        backup_previous = b"existing backup bytes\n"
+        backup_path.write_bytes(backup_previous)
+        with self.assertRaises(manage.workers.ConfigError):
+            self.installation.configure("default", "gpt-5.6-luna", "ultra")
+        self.assertEqual(config_path.read_bytes(), previous)
+        self.assertEqual(backup_path.read_bytes(), backup_previous)
+
+    def test_configure_fails_explicitly_when_validator_interface_is_missing(self):
+        self.install()
+        config_path = self.installation.skill / "workers.json"
+        backup_path = config_path.with_name("workers.json.bak")
+        config_before = config_path.read_bytes()
+        backup_before = b"existing backup bytes\n"
+        backup_path.write_bytes(backup_before)
+        validator = manage.workers.validate_worker
+        del manage.workers.validate_worker
+        try:
+            with self.assertRaises(manage.ManagementError):
+                self.installation.configure("default", effort="high")
+        finally:
+            manage.workers.validate_worker = validator
+        self.assertEqual(config_path.read_bytes(), config_before)
+        self.assertEqual(backup_path.read_bytes(), backup_before)
+
+    def test_existing_incompatible_profile_can_be_diagnosed_and_fixed(self):
+        self.install()
+        config_path = self.installation.skill / "workers.json"
+        incompatible = {
+            "version": 2,
+            "default_profile": "default",
+            "profiles": {
+                "default": {"model": "gpt-5.6-luna", "reasoning_effort": "ultra"},
+                "complex": {"model": "gpt-5.6-terra", "reasoning_effort": "high"},
+            },
+        }
+        incompatible_bytes = json.dumps(incompatible).encode()
+        config_path.write_bytes(incompatible_bytes)
+        backup_path = config_path.with_name("workers.json.bak")
+        backup_before_read = b"backup before read-only status\n"
+        backup_path.write_bytes(backup_before_read)
+        status = self.installation.status()
+        self.assertEqual(status["compatibility"]["default"]["status"], "incompatible")
+        self.assertEqual(status["compatibility"]["complex"]["status"], "compatible")
+        self.assertFalse(status["compatibility"]["complex"]["runtime_verified"])
+        self.assertEqual(config_path.read_bytes(), incompatible_bytes)
+        self.assertEqual(backup_path.read_bytes(), backup_before_read)
+
+        self.installation.configure("default", effort="high")
+        fixed = self.installation.status()
+        self.assertEqual(fixed["compatibility"]["default"]["status"], "compatible")
+        self.assertEqual(backup_path.read_bytes(), incompatible_bytes)
+        fixed_config = config_path.read_bytes()
+        fixed_backup = backup_path.read_bytes()
+        with self.assertRaises(manage.workers.ConfigError):
+            self.installation.configure("default", effort="ultra")
+        self.assertEqual(config_path.read_bytes(), fixed_config)
+        self.assertEqual(backup_path.read_bytes(), fixed_backup)
+        self.assertEqual(json.loads(config_path.read_text())["profiles"]["default"]["reasoning_effort"], "high")
+
+    def test_unknown_model_is_allowed_and_status_is_unverified(self):
+        self.install()
+        self.installation.configure("future", "provider/future-model", "medium", default=True)
+        status = self.installation.status()
+        self.assertEqual(status["compatibility"]["future"]["status"], "unverified")
+        self.assertIn("2026-09-09", status["compatibility"]["future"]["source"])
+        self.assertFalse(status["compatibility"]["future"]["runtime_verified"])
+
+    def test_status_human_output_includes_compatibility_diagnostics(self):
+        self.install()
+        config_path = self.installation.skill / "workers.json"
+        config = json.loads(config_path.read_text())
+        config["profiles"]["default"]["reasoning_effort"] = "ultra"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            manage.print_result(self.installation.status(), human=True)
+        rendered = output.getvalue()
+        self.assertIn("模型兼容性预检", rendered)
+        self.assertIn("default", rendered)
+        self.assertIn("不兼容", rendered)
+
+    def test_menu_configuration_uses_compatibility_validation(self):
+        self.install()
+        config_path = self.installation.skill / "workers.json"
+        previous = config_path.read_bytes()
+        replies = io.StringIO("2\ndefault\ngpt-5.6-luna\nultra\nn\n0\n")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            manage.menu(self.installation, self.source, replies)
+        self.assertEqual(config_path.read_bytes(), previous)
+
+    def test_update_preserves_existing_incompatible_settings(self):
+        self.install()
+        config_path = self.installation.skill / "workers.json"
+        incompatible = {
+            "version": 2,
+            "default_profile": "default",
+            "profiles": {
+                "default": {"model": "gpt-5.6-luna", "reasoning_effort": "ultra"},
+                "complex": {"model": "gpt-5.6-terra", "reasoning_effort": "high"},
+            },
+        }
+        config_path.write_text(json.dumps(incompatible), encoding="utf-8")
+        previous = config_path.read_bytes()
+        self.release()
+        result = self.installation.install(self.source, require_existing=True)
+        self.assertEqual(result["result"], "updated")
+        self.assertEqual(config_path.read_bytes(), previous)
+
     def test_invalid_candidate_does_not_replace_installation(self):
         self.install()
         old_receipt = (self.installation.skill / manage.RECEIPT).read_bytes()
@@ -120,16 +239,33 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual((self.installation.skill / manage.RECEIPT).read_bytes(), old_receipt)
         self.assertFalse(self.installation.backups.exists())
 
-    def test_missing_runtime_module_rejects_update_without_state_changes(self):
+    def test_missing_runtime_dependency_rejects_update_without_state_changes(self):
         self.install()
         self.installation.configure("default", "custom/model", "low")
+        runtime_files = (
+            "scripts/activation.py",
+            "scripts/capabilities.py",
+            "model-capabilities.json",
+        )
+        for index, relative in enumerate(runtime_files):
+            with self.subTest(relative=relative):
+                before = self.installation_snapshot()
+                (self.source_skill / relative).unlink()
+                self.release(f"9.9.{index}")
+                with self.assertRaises(manage.ManagementError):
+                    self.install()
+                self.assert_installation_snapshot(before)
+                self.assertEqual(self.installation.status()["activation"]["mode"], "auto")
+                shutil.copyfile(ROOT / "skills/delegate-workers" / relative, self.source_skill / relative)
         before = self.installation_snapshot()
-        (self.source_skill / "scripts/activation.py").unlink()
-        self.release()
+        for relative in ("scripts/capabilities.py", "model-capabilities.json"):
+            (self.source_skill / relative).unlink()
+        self.release("9.9.pair")
         with self.assertRaises(manage.ManagementError):
             self.install()
         self.assert_installation_snapshot(before)
-        self.assertEqual(self.installation.status()["activation"]["mode"], "auto")
+        for relative in ("scripts/capabilities.py", "model-capabilities.json"):
+            shutil.copyfile(ROOT / "skills/delegate-workers" / relative, self.source_skill / relative)
         self.assertFalse(self.installation.backups.exists())
 
     def test_missing_template_rejects_update_without_disabling_auto_mode(self):
@@ -230,6 +366,59 @@ class ManagementTests(unittest.TestCase):
         result = self.installation.rollback()
         self.assertEqual(result["version"], self.source_version)
         self.assertEqual(self.installation.config()["profiles"]["default"]["reasoning_effort"], "high")
+
+    def test_pre_capability_fixture_can_update_and_roll_back_from_manifest(self):
+        legacy = self.legacy_source()
+        self.assertEqual(self.installation.install(legacy)["version"], "0.4.0")
+        legacy_config = (self.installation.skill / "workers.json").read_bytes()
+        legacy_rules = (self.home / "AGENTS.md").read_bytes()
+        updated = self.installation.install(self.source, require_existing=True)
+        self.assertEqual(updated["version"], self.source_version)
+        old_backup = Path(updated["backup"])
+        old_receipt = json.loads((old_backup / manage.RECEIPT).read_text())
+        self.assertNotIn("scripts/capabilities.py", old_receipt["files"])
+        self.assertNotIn("model-capabilities.json", old_receipt["files"])
+
+        # This is an unmanaged same-named file in the old backup, not its receipt manifest.
+        (old_backup / "scripts/capabilities.py").write_text("personal legacy file", encoding="utf-8")
+        rolled_back = self.installation.rollback()
+        self.assertEqual(rolled_back["version"], "0.4.0")
+        self.assertEqual((self.installation.skill / "workers.json").read_bytes(), legacy_config)
+        self.assertEqual((self.home / "AGENTS.md").read_bytes(), legacy_rules)
+        self.assertFalse((self.installation.skill / "scripts/capabilities.py").exists())
+        self.assertFalse((self.installation.skill / "model-capabilities.json").exists())
+
+    def test_installed_cli_rejects_and_repairs_real_incompatible_profile(self):
+        self.install()
+        command = str(self.short_command())
+        config_path = self.installation.skill / "workers.json"
+        backup_path = config_path.with_name("workers.json.bak")
+        config_before = config_path.read_bytes()
+        backup_before = b"existing backup bytes\n"
+        backup_path.write_bytes(backup_before)
+
+        failed = subprocess.run(
+            [command, "configure", "--profile", "default", "--model", "gpt-5.6-luna",
+             "--effort", "ultra"],
+            cwd=self.root, capture_output=True, text=True, encoding="utf-8")
+        self.assertEqual(failed.returncode, 2)
+        self.assertEqual(config_path.read_bytes(), config_before)
+        self.assertEqual(backup_path.read_bytes(), backup_before)
+
+        repaired = subprocess.run(
+            [command, "configure", "--profile", "default", "--effort", "high"],
+            cwd=self.root, capture_output=True, text=True, encoding="utf-8", check=True)
+        self.assertEqual(json.loads(repaired.stdout)["profiles"]["default"]["reasoning_effort"], "high")
+        self.assertEqual(backup_path.read_bytes(), config_before)
+        config_after = config_path.read_bytes()
+        backup_after = backup_path.read_bytes()
+        status = subprocess.run(
+            [command, "status"], cwd=self.root, capture_output=True, text=True,
+            encoding="utf-8", check=True)
+        status_value = json.loads(status.stdout)
+        self.assertEqual(status_value["compatibility"]["default"]["status"], "compatible")
+        self.assertEqual(config_path.read_bytes(), config_after)
+        self.assertEqual(backup_path.read_bytes(), backup_after)
 
     def test_failed_swap_restores_previous_code_and_launcher(self):
         self.install()

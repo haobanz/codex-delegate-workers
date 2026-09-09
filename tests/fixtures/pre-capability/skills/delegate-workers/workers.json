@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "default_profile": "default",
+  "profiles": {
+    "default": {
+      "model": "gpt-5.6-luna",
+      "reasoning_effort": "max"
+    }
+  }
+}

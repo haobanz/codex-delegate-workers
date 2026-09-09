@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "source": "Codex native spawn schema snapshot 2026-09-09 (local tool declaration; not an official model catalog and not account availability)",
+  "models": {
+    "gpt-6-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
+    "gpt-5.5": ["low", "medium", "high", "xhigh"]
+  }
+}

@@ -1,12 +1,12 @@
 # Delegate Workers
 
-在 Codex 中设置执行子代理的模型和思考强度，任务分配交给当前主代理。
+在 Codex 中设置执行子代理的模型和思考强度偏好，并在实际派发前做静态兼容性预检；任务分配交给当前主代理。
 
 **主代理始终沿用你在 Codex 中选择的模型和思考强度。** 主代理负责规划、拆分任务与最终验收；本项目只设置执行子代理，不修改 `config.toml`，不要求主代理使用 Sol 或 Astra。
 
-新安装默认启用模型偏好：新 Codex 会话在分派工作时会读取执行预设，无需每次输入技能名。是否分派、任务怎么拆、用哪个模型、并行多少、是否重试或继续分派，都由模型根据任务判断。
+新安装默认启用模型偏好：新 Codex 会话在分派工作时会读取执行预设，无需每次输入技能名。是否分派、任务怎么拆、用哪个模型、并行多少、是否重试或继续分派，都由主代理根据任务判断；用户明确指定的分工、模型、强度和范围优先。
 
-`0.3.0` 已移除固定并发数、重试次数、升级链和子代理继续分派限制，也不要求维护任务记录。新版兼容读取旧配置，并保留原有模型与思考强度。
+`0.6.0` 保留无固定并发数、重试次数、升级链和任务记录的边界，并增加显式的项目级 `AGENTS.md` 委派规则。新版兼容读取旧配置，保留用户的模型与思考强度，不会为通过预检或项目初始化而自动换模型或 fallback。
 
 ## 环境要求
 
@@ -69,7 +69,7 @@ dw mode on-demand   # 关闭：恢复按需匹配，也可手动指定技能
 dw status          # 查看开关和规则是否正常
 ```
 
-开启时，安装器在 Codex 的全局指令文件中维护一个带标记的独立段落，让主代理在分派工作时读取模型预设。具体分工由模型自行安排。它使用当前有效的 `AGENTS.md`；如果已有非空的 `AGENTS.override.md`，则使用后者。
+开启时，安装器只在 Codex 的全局指令文件中维护一个带标记的独立段落，让主代理在分派工作时读取模型预设；具体分工仍由模型自行安排。全局模式使用全局有效的 `AGENTS.md`；如果已有非空的 `AGENTS.override.md`，则使用后者。它不会注册或修改任何项目。
 
 原有指令按字节保留，修改前会备份。关闭或卸载时只移除本项目的指令段。若该段被手动修改、丢失，或被新建的 override 文件遮蔽，状态页会报告问题；重新执行 `dw mode auto` 可补回完整缺失的规则或迁移被遮蔽的规则，手动改过的指令段不会被直接覆盖。
 
@@ -82,7 +82,7 @@ dw status          # 查看开关和规则是否正常
 | 常用模型 `default` | `gpt-5.6-luna` | 中 `medium` |
 | 备选模型 `complex` | `gpt-5.6-terra` | 高 `high` |
 
-预设表示模型偏好，不是只能使用这些模型的白名单。实际模型可用性、思考档位和运行容量以当前 Codex 环境为准。
+预设表示模型偏好，不是只能使用这些模型的白名单；仓库默认仍为 `medium`。实际模型可用性、思考档位和运行容量以当前 Codex 环境为准。
 
 默认委派开启后的使用示例（无需技能前缀）：
 
@@ -97,6 +97,89 @@ $delegate-workers
 这次执行优先使用 gpt-5.6-luna、high 思考强度，由你安排分工。
 保留当前主代理设置，不把这次参数保存为默认值。
 ```
+
+上例只是用户明确提出固定参数时的可选示例，不是所有用户或所有任务的长期要求。
+
+## 项目级 `AGENTS.md` 委派规则（显式选择加入）
+
+全局 `dw mode auto` / `dw mode on-demand` 管理的是本工具在 Codex 全局指令中的默认规则；`dw uninstall` 移除整套全局安装、启动器和全局规则段。它们不自动扫描、注册或修改项目。项目级规则是独立的显式选择加入：
+
+```bash
+dw project init
+dw project init --path /path/to/repo --profile complex
+dw project init --path /path/to/repo --model gpt-5.6-luna --effort max
+
+dw project status
+dw project sync
+dw project disable
+```
+
+`init` 会在选定项目根立即创建或合并正确拼写的 `AGENTS.md`（不是 `agent.md`），保留原有内容并只维护带标记的项目规则段。项目根已有非空 `AGENTS.override.md` 时，Codex 使用它作为活动规则文件；工具会针对这个活动文件处理规则。所有权元数据保存在项目根的 `.delegate-workers-project.json`。如果受管理段被用户编辑，写入操作会停止，不会覆盖这些编辑；禁用流程保留可恢复备份。
+
+项目状态文件 `.delegate-workers-project.json` 保存执行快照和受管理文件的所有权信息；如果要分享或复制这套项目生命周期，应让它和 `AGENTS.md`（或活动的 `AGENTS.override.md`）一起保留，不能只分享规则文件。项目根的 `.delegate-workers-project.lock` 是跨安装位置仍保持稳定的持久锁，操作期间不会删除；`.delegate-workers-project-backups/<timestamp-id>/manifest.json` 及其中的 preimage 文件保存变更前内容，用于可逆禁用和恢复。锁和备份是本地操作产物，通常不应提交到 Git；请按仓库策略自行将它们加入忽略规则，本工具不会自动修改 `.gitignore`。
+
+项目根从当前目录或 `--path` 解析 Git 仓库 / worktree 根；非 Git 目录的写入操作必须显式提供 `--path`。`init` 可选接受 `--profile`，或同时以 `--model` 与 `--effort` 指定执行参数。初始化时会保存所选 profile 或显式模型/强度快照；之后不带参数重复 `init` 以及 `sync` 都保留该快照，即使全局 `workers.json` 已变化。示例中的 Luna/max 只是显式参数示例，不是所有用户的默认值。
+
+`sync` 只更新已经注册且启用的项目，而且必须由用户显式调用；不会后台持续重建、全局扫描、隐式选择加入，或修改其他项目。`status` 只读，可提示从项目根到请求目录之间的嵌套规则可能覆盖项目规则，但这只是路径和文件诊断，不是语义效果证明。`disable` 只停用当前项目的注册规则，和全局 `dw mode on-demand`、`dw uninstall` 不是同一操作；后两者不会代替项目生命周期管理。
+
+启用项目规则表示用户为这个项目选择了明确分工：主代理负责规划与审查，执行工作交给指定的执行模型，并把实际模型和强度作为显式请求传递。这与普通执行预设允许主代理自行决定是否分派不同，但项目规则的存在仍不等于某个会话已经加载它，也不等于实际派发或运行时 worker 身份已经发生。状态只分别标明规则的静态检查结果，并将会话加载和运行时身份保持为未验证或未知；其中 `session_loaded: null` 表示会话是否加载未知，不是证明活动会话没有加载，`runtime_verified: false` 也不证明没有实际运行。只有有实际证据时才报告派发和运行身份。模型或强度不可用时应如实报告并询问替代，不要静默 fallback。
+
+Codex 官方文档说明指令在运行开始时加载：全局层的 `AGENTS.override.md` 优先于 `AGENTS.md`，项目层按 Git 根到当前目录加载规则，较深目录的规则优先，并有默认的 32 KiB 总限制。[Codex AGENTS.md 文档](https://learn.chatgpt.com/docs/agent-configuration/agents-md) 解释了这些加载关系；因此本工具分别标明规则的静态检查结果，并把会话加载和运行时身份作为未验证或未知，不能把其中一个当成另外两个的保证。
+
+## 能力预检与 Codex 配置片段
+
+配置工具保持三个不同的用途：
+
+- `validate_config` 只做配置结构检查和 v1 → v2 迁移，不改变用户参数。
+- `show` 返回纯结构配置，不做能力预检；因此结构合法但不兼容的旧配置仍可读取并恢复。
+- `validate` 检查所有 profile 的实际模型/强度组合并逐 profile 返回 `compatibility`；`resolve` 只检查最终选中的组合（包括临时覆盖），不写回配置。
+
+```bash
+python3 skills/delegate-workers/scripts/workers.py show
+python3 skills/delegate-workers/scripts/workers.py validate
+python3 skills/delegate-workers/scripts/workers.py resolve --profile complex
+python3 skills/delegate-workers/scripts/workers.py resolve --model gpt-5.6-luna --effort max
+```
+
+在 `resolve` 输出中，选中组合的状态路径是 `compatibility.status`；`validate` 输出则按 profile 放在 `compatibility.<profile>.status`。这两种 `workers.py` 预检结果的状态为 `compatible` 或 `unverified`，并带有来源 `source`；`runtime_verified` 始终为 `false`，因为这里没有运行时身份探测。`dw status` 是更宽的管理诊断，除这两种状态外还可能报告 `incompatible` 或 `error`。已知模型与不支持的思考强度组合会报错；未知模型保持原样并标记为 `unverified`、给出警告，不会自动换模型、profile 或 fallback。
+
+内置快照来自 2026-09-09 本机 Codex native spawn 工具声明，仅包含：`gpt-6-astra`、`gpt-5.6-sol`、`gpt-5.6-terra` 的 `low/medium/high/xhigh/max/ultra`，`gpt-5.6-luna` 的 `low/medium/high/xhigh/max`，以及 `gpt-5.5` 的 `low/medium/high/xhigh`。它不是官方模型目录，也不证明当前账户可用。
+
+调用者可以通过全局参数 `--capabilities PATH` 提供完整能力声明；它必须放在子命令前：
+
+```bash
+python3 skills/delegate-workers/scripts/workers.py \
+  --capabilities /path/to/capabilities.json validate
+```
+
+声明格式固定为：
+
+```json
+{
+  "version": 1,
+  "source": "caller-provided snapshot 2026-09-09",
+  "models": {
+    "exact-model-id": ["low", "max"]
+  }
+}
+```
+
+`source` 必须是非空描述，`models` 必须非空；显式声明是调用者提供的完整集合，可以覆盖内置快照，但其中没有的模型会被拒绝，不会回落内置数据。不要编造 catalog 只为通过检查。`dw configure` 按内置快照检查新设置；`dw status` 诊断每个 profile，人类菜单也展示诊断。已有不兼容配置仍可查看，再修正强度后保存。
+
+只读命令 `codex-config` 通过预检后仅输出下面两个 `[agents]` 键的 TOML 片段，例如：
+
+```bash
+python3 skills/delegate-workers/scripts/workers.py \
+  codex-config --model gpt-5.6-luna --effort max
+```
+
+```toml
+[agents]
+default_subagent_model = "gpt-5.6-luna"
+default_subagent_reasoning_effort = "max"
+```
+
+它不读取或写入全局 `config.toml`，不自动安装，也不修改主模型。若配置中已有 `[agents]` 表，应审核后把两个键合并进去，不要重复声明表。未知模型的警告写入 stderr，不污染 stdout 的 TOML 片段。两个字段是可选的原生默认值，不是硬锁；显式 spawn 值优先，且不能保证所有客户端版本都支持。字段含义和优先级以 [OpenAI 官方 Subagents 全局设置](https://learn.chatgpt.com/docs/agent-configuration/subagents#global-settings) 为准。
 
 ## 一键更新
 
@@ -117,6 +200,7 @@ curl -fsSL https://raw.githubusercontent.com/haobanz/codex-delegate-workers/main
 - 更新保留你的执行模型和思考强度；迁移旧格式时移除已经停用的调度限制，原文件留有备份。
 - 更新保留默认委派开关；默认委派处于开启状态时，也会更新本工具维护的规则段。
 - 更新前备份旧版本，检查必要文件、模型配置、Python 脚本和管理入口能否启动，再替换安装目录。
+- 能力预检模块与内置快照作为成对运行时依赖纳入候选清单；回滚到合法旧版本时按旧版本清单处理，不会被当前版本的能力文件要求误拒。
 - 网络失败、配置不兼容或替换失败时，保留或恢复旧版本。
 - 如果你修改了安装目录里的 Skill 代码，更新会报告冲突，不覆盖这些修改。
 - **5. 回滚版本（保留执行设置）** 回滚代码并保留当前执行设置；如果旧代码无法读取当前设置，会停止回滚。
@@ -169,6 +253,8 @@ Windows 卸载还会移除本安装器添加的用户 PATH 条目；原本就存
   skills/delegate-workers/             Skill 与管理工具
     workers.json                       唯一的持久执行模型配置
     workers.json.bak                   最近一次设置修改前的备份
+    model-capabilities.json             带来源的内置能力快照
+    scripts/capabilities.py             能力声明校验模块
     .delegate-workers-install.json     安装版本与受管理文件记录
   delegate-workers-backups/            代码和指令文件备份
 ```
@@ -223,8 +309,8 @@ bash -n install.sh
 python3 skills/delegate-workers/scripts/workers.py validate
 ```
 
-模型预设工具用法见 [配置参考](docs/configuration.md)。工具只读取和保存模型参数，不接管主代理的规划和调度。
+模型预设与预检工具用法见 [配置参考](docs/configuration.md)。工具只读取、校验和保存执行参数，不接管主代理的规划、调度或主模型。
 
-CI 覆盖 Linux、macOS、Windows 的 Python 3.10 / 3.13；Windows 还分别运行 PowerShell 5.1 和 7 的安装、设置、更新、卸载测试。具体执行结果见仓库 Actions。
+仓库提供 Linux、macOS、Windows 的 Python 3.10 / 3.13 及 Windows PowerShell/CMD 测试路径；各平台是否通过以实际 CI 运行结果为准，本文不替代测试报告。
 
 本项目为独立实现，现有社区项目仅作为设计参考，没有安装或引入其代码。Codex 原生能力参考：[Skills](https://learn.chatgpt.com/docs/build-skills)、[Subagents](https://learn.chatgpt.com/docs/agent-configuration/subagents)。
