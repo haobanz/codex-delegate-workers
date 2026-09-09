@@ -102,29 +102,31 @@ $delegate-workers
 
 ## 项目级 `AGENTS.md` 委派规则（显式选择加入）
 
-全局 `dw mode auto` / `dw mode on-demand` 管理的是本工具在 Codex 全局指令中的默认规则；`dw uninstall` 移除整套全局安装、启动器和全局规则段。它们不自动扫描、注册或修改项目。项目级规则是独立的显式选择加入：
+项目级规则与全局默认委派相互独立。安装完成后，在 Git 项目目录或其子目录中运行这一条命令：
 
 ```bash
 dw project init
-dw project init --path /path/to/repo --profile complex
-dw project init --path /path/to/repo --model gpt-5.6-luna --effort max
-
-dw project status
-dw project sync
-dw project disable
 ```
 
-`init` 会在选定项目根立即创建或合并正确拼写的 `AGENTS.md`（不是 `agent.md`），保留原有内容并只维护带标记的项目规则段。项目根已有非空 `AGENTS.override.md` 时，Codex 使用它作为活动规则文件；工具会针对这个活动文件处理规则。所有权元数据保存在项目根的 `.delegate-workers-project.json`。如果受管理段被用户编辑，写入操作会停止，不会覆盖这些编辑；禁用流程保留可恢复备份。
+不需要填写 `--path`、`--model` 或 `--effort`，也不需要其它设置。工具会自动定位 Git 仓库 / worktree 根；新项目继承已安装配置的默认执行预设。已有项目不带参数重复 `init` 会保留该项目已有的执行快照。
 
-项目状态文件 `.delegate-workers-project.json` 保存执行快照和受管理文件的所有权信息；如果要分享或复制这套项目生命周期，应让它和 `AGENTS.md`（或活动的 `AGENTS.override.md`）一起保留，不能只分享规则文件。项目根的 `.delegate-workers-project.lock` 是跨安装位置仍保持稳定的持久锁，操作期间不会删除；`.delegate-workers-project-backups/<timestamp-id>/manifest.json` 及其中的 preimage 文件保存变更前内容，用于可逆禁用和恢复。锁和备份是本地操作产物，通常不应提交到 Git；请按仓库策略自行将它们加入忽略规则，本工具不会自动修改 `.gitignore`。
+工具会创建或合并项目根的 `AGENTS.md`，保留原有内容；若已有非空 `AGENTS.override.md`，则在该活动文件中维护规则。只有目标目录不是 Git 项目时，才需要显式路径；请在该目标非 Git 目录中执行：
 
-项目根从当前目录或 `--path` 解析 Git 仓库 / worktree 根；非 Git 目录的写入操作必须显式提供 `--path`。`init` 可选接受 `--profile`，或同时以 `--model` 与 `--effort` 指定执行参数。初始化时会保存所选 profile 或显式模型/强度快照；之后不带参数重复 `init` 以及 `sync` 都保留该快照，即使全局 `workers.json` 已变化。示例中的 Luna/max 只是显式参数示例，不是所有用户的默认值。
+```bash
+dw project init --path .
+```
 
-`sync` 只更新已经注册且启用的项目，而且必须由用户显式调用；不会后台持续重建、全局扫描、隐式选择加入，或修改其他项目。`status` 只读，可提示从项目根到请求目录之间的嵌套规则可能覆盖项目规则，但这只是路径和文件诊断，不是语义效果证明。`disable` 只停用当前项目的注册规则，和全局 `dw mode on-demand`、`dw uninstall` 不是同一操作；后两者不会代替项目生命周期管理。
+日常管理：
 
-启用项目规则表示用户为这个项目选择了明确分工：主代理负责规划与审查，执行工作交给指定的执行模型，并把实际模型和强度作为显式请求传递。这与普通执行预设允许主代理自行决定是否分派不同，但项目规则的存在仍不等于某个会话已经加载它，也不等于实际派发或运行时 worker 身份已经发生。状态只分别标明规则的静态检查结果，并将会话加载和运行时身份保持为未验证或未知；其中 `session_loaded: null` 表示会话是否加载未知，不是证明活动会话没有加载，`runtime_verified: false` 也不证明没有实际运行。只有有实际证据时才报告派发和运行身份。模型或强度不可用时应如实报告并询问替代，不要静默 fallback。
+```bash
+dw project status   # 查看状态（只读）
+dw project sync    # 更新规则，保留项目配置
+dw project disable # 停用项目规则
+```
 
-Codex 官方文档说明指令在运行开始时加载：全局层的 `AGENTS.override.md` 优先于 `AGENTS.md`，项目层按 Git 根到当前目录加载规则，较深目录的规则优先，并有默认的 32 KiB 总限制。[Codex AGENTS.md 文档](https://learn.chatgpt.com/docs/agent-configuration/agents-md) 解释了这些加载关系；因此本工具分别标明规则的静态检查结果，并把会话加载和运行时身份作为未验证或未知，不能把其中一个当成另外两个的保证。
+非 Git 目录中的上述命令也需加 `--path .`。
+
+全局 `dw mode auto` / `dw mode on-demand` 与项目规则独立，`dw uninstall` 也不会代替项目生命周期管理；规则文件的静态检查通过，也不保证当前活动会话已经加载规则或实际运行了 worker。高级参数、快照、所有权、锁、备份、用户编辑保护和状态边界见 [项目配置文档](docs/configuration.md#项目级规则与全局模式)。
 
 ## 能力预检与 Codex 配置片段
 

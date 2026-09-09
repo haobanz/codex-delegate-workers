@@ -23,22 +23,67 @@
 
 `workers.json`、`dw configure`、全局 `dw status`、`dw mode` 和 `dw uninstall` 管理的是本工具的全局安装与执行预设。全局模式的默认规则段不会自动注册项目，也不会因为当前任务位于某个仓库就修改项目文件。
 
-项目级规则必须显式选择加入，并通过以下命令单独管理：
+项目级规则必须显式选择加入。安装完成后，在 Git 项目目录或其子目录中，最短初始化路径是：
+
+```bash
+dw project init
+```
+
+不需要填写 `--path`、`--model` 或 `--effort`，也不需要其它设置。工具会自动定位 Git 仓库 / worktree 根；新项目继承已安装配置的默认执行预设。已有项目不带参数重复 `init` 会继续使用项目状态中保存的执行快照，即使全局 `workers.json` 已变化。
+
+非 Git 目录中的项目命令仍必须显式提供 `--path`；请在目标非 Git 目录中使用这一行：
+
+```bash
+dw project init --path .
+```
+
+### `init` 的可选参数
+
+下面参数都是可选的定制项，不是初始化的必填项：
 
 ```bash
 dw project init [--path PATH] [--profile NAME] [--model MODEL] [--effort EFFORT]
-dw project sync [--path PATH]
-dw project status [--path PATH]
-dw project disable [--path PATH]
 ```
 
-`init` 立即在选定项目根创建或合并正确的 `AGENTS.md`，保留现有内容并维护带标记的规则段；它不会创建错误拼写的 `agent.md`。如果项目根存在非空 `AGENTS.override.md`，该文件是活动目标。所有权元数据写入项目根 `.delegate-workers-project.json`；用户编辑受管理段时，写入会停止而不会覆盖编辑，禁用保留可逆备份。
+省略参数时，新 Git 项目使用已安装配置的默认 profile；`--profile NAME` 可选择另一个已配置预设，例如：
+
+```bash
+dw project init --profile complex
+```
+
+也可以显式覆盖模型和强度：
+
+```bash
+dw project init --model gpt-5.6-luna --effort max
+```
+
+`--model` 必须同时提供 `--effort`；`--effort` 可以单独覆盖强度。需要操作其它目录时显式使用 `--path`，例如：
+
+```bash
+dw project init --path /path/to/other-project --profile complex
+```
+
+仓库默认预设是 `gpt-5.6-luna` / `medium`；用户本机可以有不同的已安装配置，因此上面的 Luna/max 只是显式定制示例，不是所有用户的默认值。
+
+### 项目文件、所有权与可逆变更
+
+`init` 立即在选定项目根创建或合并正确的 `AGENTS.md`，保留现有内容并维护带标记的规则段；它不会创建错误拼写的 `agent.md`。如果项目根存在非空 `AGENTS.override.md`，该文件优先作为活动目标，工具会针对这个活动文件处理规则。所有权元数据写入项目根 `.delegate-workers-project.json`；用户编辑受管理段时，写入会停止而不会覆盖编辑，禁用保留可逆备份。
 
 `.delegate-workers-project.json` 保存项目执行快照和受管理文件的所有权；分享或复制项目生命周期时，应与 `AGENTS.md`（或活动的 `AGENTS.override.md`）一起保留。`.delegate-workers-project.lock` 是项目根的稳定持久锁，操作期间不会删除；`.delegate-workers-project-backups/<timestamp-id>/manifest.json` 与其中的 preimage 文件保存变更前内容，供禁用和恢复使用。锁与备份通常不应提交到 Git；请按仓库策略自行忽略它们，本工具不会自动修改 `.gitignore`。
 
-Git 仓库或 worktree 根从当前目录或 `--path` 解析；非 Git 目录的变更必须显式提供 `--path`。初始化时从选定 profile 或显式的模型/强度参数保存项目快照；之后无参数重复 `init` 和 `sync` 都使用原快照，不随全局配置变化。Luna/max 只能作为显式参数示例，不是仓库默认或通用硬编码。
+### `status`、`sync` 与 `disable`
+
+```bash
+dw project status [--path PATH]
+dw project sync [--path PATH]
+dw project disable [--path PATH]
+```
+
+非 Git 目录同样需要 `--path`；`sync` 使用已保存的项目执行快照，不会随全局配置变化而切换模型或强度。
 
 `sync` 只作用于已经注册且启用的项目，且是用户显式调用的后续更新；没有后台持续重建、全局扫描或隐式选择加入。`status` 是只读诊断，可以指出从项目根到请求目录的嵌套规则存在潜在覆盖，但不证明规则的语义效果。`disable` 只停用一个项目规则，不能和全局 `dw mode on-demand` 或 `dw uninstall` 混用：后两者分别管理全局委派段和整个工具安装，不会代替项目生命周期操作。
+
+### 状态与运行时边界
 
 启用项目规则代表该项目明确选择“主代理规划和审查、执行工作交给指定执行模型”的分工；普通全局预设仍允许主代理按任务决定是否分派。项目规则不会强制声称已经执行：状态只分别标明规则的静态检查结果，并将会话加载、实际派发以及运行时 worker 身份保持为未验证或未知；其中 `session_loaded: null` 表示会话是否加载未知，不是证明活动会话没有加载，`runtime_verified: false` 也不证明没有实际运行。执行模型或强度不可用时，应报告不可用并询问替代，不要静默 fallback。
 
