@@ -443,7 +443,8 @@ class Installation:
             if source is not None:
                 root = Path(source).expanduser().resolve()
                 return self.apply(root / "skills" / PROJECT, revision_of(root))
-            with tempfile.TemporaryDirectory(prefix="delegate-workers-download-") as temporary:
+            with tempfile.TemporaryDirectory(prefix="delegate-workers-download-",
+                                             dir=platform_support.project_tmp()) as temporary:
                 root = Path(temporary) / "repository"
                 run_git(["clone", "--quiet", "--depth", "1", "--branch", "main", "--",
                          REPOSITORY, str(root)])

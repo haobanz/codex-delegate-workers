@@ -2,10 +2,12 @@ import importlib.util
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+
+from temp_support import temporary_directory
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,8 +18,61 @@ SPEC.loader.exec_module(platform)
 
 
 class PlatformTests(unittest.TestCase):
+    def test_project_temp_uses_git_and_worktree_roots_from_nested_directory(self):
+        with temporary_directory(prefix="delegate-temp-roots-") as directory:
+            for kind in ("repository", "worktree"):
+                root = Path(directory).resolve() / kind
+                nested = root / "src" / "中文 space"
+                nested.mkdir(parents=True)
+                marker = root / ".git"
+                if kind == "repository":
+                    marker.mkdir()
+                else:
+                    marker.write_text("gitdir: unused-test-marker\n", encoding="utf-8")
+                target = platform.project_tmp(nested)
+                self.assertEqual(target, root / "tmp")
+                sentinel = target / "other-task.txt"
+                sentinel.write_text("keep", encoding="utf-8")
+                self.assertEqual(platform.project_tmp(nested), target)
+                self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+                self.assertFalse((nested / "tmp").exists())
+
+    def test_project_temp_without_git_uses_invoking_directory(self):
+        with temporary_directory(prefix="delegate-temp-no-git-") as directory:
+            current = Path(directory).resolve()
+            original_exists = Path.exists
+            # Mask this test checkout's ancestor marker to simulate a non-Git project.
+            with patch.object(Path, "exists", lambda path:
+                              False if path.name == ".git" else original_exists(path)), \
+                    patch.object(Path, "cwd", return_value=current):
+                self.assertEqual(platform.project_tmp(), current / "tmp")
+            self.assertTrue((current / "tmp").is_dir())
+
+    def test_project_temp_unusable_directory_does_not_fallback(self):
+        with temporary_directory(prefix="delegate-temp-blocked-") as directory:
+            root = Path(directory).resolve()
+            (root / ".git").mkdir()
+            (root / "tmp").write_text("user file", encoding="utf-8")
+            with self.assertRaises(OSError):
+                platform.project_tmp(root)
+            self.assertEqual((root / "tmp").read_text(encoding="utf-8"), "user file")
+
+    def test_project_temp_rejects_symlink_redirection(self):
+        with temporary_directory(prefix="delegate-temp-links-") as directory:
+            root = Path(directory).resolve()
+            (root / ".git").mkdir()
+            outside = root / "other"
+            outside.mkdir()
+            try:
+                (root / "tmp").symlink_to(outside, target_is_directory=True)
+            except OSError:
+                self.skipTest("Symbolic links unavailable")
+            with self.assertRaises(OSError):
+                platform.project_tmp(root)
+            self.assertEqual(list(outside.iterdir()), [])
+
     def test_native_lock_excludes_other_process_and_releases(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory() as directory:
             path = Path(directory) / "lock"
             code = (
                 "import sys\n"
@@ -45,7 +100,7 @@ class PlatformTests(unittest.TestCase):
         self.assertEqual(platform.update_path(appended, r"D:\Delegate Workers", remove=True), original)
 
     def test_windows_python_entry_preserves_unicode_paths_and_arguments(self):
-        with tempfile.TemporaryDirectory(prefix="delegate path ") as directory:
+        with temporary_directory(prefix="delegate path ") as directory:
             root = Path(directory) / "中文"
             root.mkdir()
             script = root / "manager.py"
@@ -60,7 +115,7 @@ class PlatformTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows CMD runtime")
     def test_native_windows_batch_entry_and_exit_code(self):
-        with tempfile.TemporaryDirectory(prefix="delegate command ") as directory:
+        with temporary_directory(prefix="delegate command ") as directory:
             root = Path(directory) / "中文"
             root.mkdir()
             script = root / "manager.py"
@@ -86,7 +141,7 @@ class PlatformTests(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows CMD runtime")
     def test_native_batch_can_be_deleted_by_its_child(self):
-        with tempfile.TemporaryDirectory(prefix="delegate self removal ") as directory:
+        with temporary_directory(prefix="delegate self removal ") as directory:
             root = Path(directory)
             command = root / "dw.cmd"
             script = root / "manager.py"

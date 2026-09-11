@@ -4,10 +4,12 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+
+from temp_support import temporary_directory
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,9 +29,16 @@ COMPLEX = {"model": "gpt-5.6-terra", "reasoning_effort": "high"}
 
 class ProjectRulesTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="delegate-project-")
+        self.temporary = temporary_directory(prefix="delegate-project-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
+        # The production resolver strips GIT_* variables deliberately. Reapply
+        # a discovery boundary only in tests so non-Git fixtures stay isolated.
+        clean_environment = project_rules._clean_git_environment
+        boundary = patch.object(project_rules, "_clean_git_environment", side_effect=lambda: {
+            **clean_environment(), "GIT_CEILING_DIRECTORIES": str(self.root)})
+        boundary.start()
+        self.addCleanup(boundary.stop)
 
     def project(self, name="project", *, git=True):
         path = self.root / name

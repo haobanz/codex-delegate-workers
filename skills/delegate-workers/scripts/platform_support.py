@@ -16,6 +16,18 @@ else:
 WINDOWS = os.name == "nt"
 
 
+def project_tmp(start=None):
+    """Create scratch space in the invoking project, never the system temp dir."""
+    current = Path(start or Path.cwd()).resolve()
+    root = next((path for path in (current, *current.parents)
+                 if (path / ".git").exists()), current)
+    directory = root / "tmp"
+    directory.mkdir(exist_ok=True)
+    if directory.is_symlink() or directory.resolve() != directory:
+        raise OSError(f"项目临时目录不能重定向到其他位置：{directory}")
+    return directory
+
+
 def configure_console():
     if WINDOWS:
         for stream in (sys.stdout, sys.stderr):

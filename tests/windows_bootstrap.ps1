@@ -20,10 +20,26 @@ function Assert-BytesEqual {
 
 function Invoke-Bootstrap {
     param([hashtable]$Options)
-    & $script:InstallScript @Options
+    . $script:InstallScript @Options
     $exitCode = $LASTEXITCODE
     if ($exitCode -ne 0) {
         throw "install.ps1 failed with exit code $exitCode"
+    }
+
+    $probePath = $null
+    try {
+        $probePath = New-BootstrapTempDirectory
+        $probeParent = (Get-Item -LiteralPath $probePath -Force).Parent.FullName
+        Assert-True ([string]::Equals(
+                $probeParent,
+                $script:ExpectedProjectTempRoot,
+                [System.StringComparison]::OrdinalIgnoreCase)) `
+            'bootstrap temporary directory was outside the project tmp directory'
+    }
+    finally {
+        if ($probePath -and (Test-Path -LiteralPath $probePath)) {
+            Remove-Item -LiteralPath $probePath -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -43,15 +59,37 @@ function Invoke-CommandFile {
 
 $repo = (Get-Item -LiteralPath (Join-Path $PSScriptRoot '..')).FullName
 $script:InstallScript = Join-Path $repo 'install.ps1'
-$temporaryRoot = Join-Path ([System.IO.Path]::GetTempPath()) (
+$projectTempRoot = Join-Path $repo 'tmp'
+$temporaryRoot = Join-Path $projectTempRoot (
     'delegate-workers-windows-test-' + [guid]::NewGuid().ToString('N')
 )
+$unrelatedSibling = Join-Path $projectTempRoot (
+    'unrelated-' + [guid]::NewGuid().ToString('N')
+)
+$unrelatedMarker = Join-Path $unrelatedSibling 'marker.txt'
+$unrelatedSiblingCreated = $false
 $temporaryRootCreated = $false
 $scriptExitCode = 0
 
 try {
+    $projectTempItem = Get-Item -LiteralPath $projectTempRoot -Force -ErrorAction SilentlyContinue
+    if ($null -ne $projectTempItem -and
+        (($projectTempItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "Project tmp directory is a reparse point: $projectTempRoot"
+    }
+    if ($null -eq $projectTempItem) {
+        New-Item -ItemType Directory -Path $projectTempRoot -ErrorAction Stop | Out-Null
+    }
+    $script:ExpectedProjectTempRoot = (Get-Item -LiteralPath $projectTempRoot -Force).FullName
+    New-Item -ItemType Directory -Path $unrelatedSibling -ErrorAction Stop | Out-Null
+    $unrelatedSiblingCreated = $true
+    [System.IO.File]::WriteAllText($unrelatedMarker, 'preserve this sibling')
+
     New-Item -ItemType Directory -Path $temporaryRoot | Out-Null
     $temporaryRootCreated = $true
+    $tmpEntriesBefore = @(
+        Get-ChildItem -LiteralPath $projectTempRoot -Force | ForEach-Object { $_.FullName }
+    )
 
     # Build the Unicode part at runtime so this file stays ASCII for PS 5.1.
     $codexHome = Join-Path $temporaryRoot ('codex home ' + [char]0x4e2d + [char]0x6587)
@@ -64,6 +102,13 @@ try {
 
     $pathBefore = [Environment]::GetEnvironmentVariable('Path', 'Process')
     Invoke-Bootstrap @{ Source = $repo; CodexHome = $codexHome; NoPath = $true }
+    $tmpEntriesAfterInstall = @(
+        Get-ChildItem -LiteralPath $projectTempRoot -Force | ForEach-Object { $_.FullName }
+    )
+    Assert-True ($null -eq (Compare-Object ($tmpEntriesBefore | Sort-Object) ($tmpEntriesAfterInstall | Sort-Object))) `
+        'install left a bootstrap temporary directory behind'
+    Assert-True (Test-Path -LiteralPath $unrelatedMarker -PathType Leaf) `
+        'install removed an unrelated bootstrap sibling'
     Assert-True ($pathBefore -eq [Environment]::GetEnvironmentVariable('Path', 'Process')) `
         'NoPath changed the current process PATH'
 
@@ -84,6 +129,13 @@ try {
     $settingsBeforeUpdate = [System.IO.File]::ReadAllBytes($settingsPath)
 
     Invoke-Bootstrap @{ Action = 'update'; Source = $repo; CodexHome = $codexHome; NoPath = $true }
+    $tmpEntriesAfterUpdate = @(
+        Get-ChildItem -LiteralPath $projectTempRoot -Force | ForEach-Object { $_.FullName }
+    )
+    Assert-True ($null -eq (Compare-Object ($tmpEntriesBefore | Sort-Object) ($tmpEntriesAfterUpdate | Sort-Object))) `
+        'update left a bootstrap temporary directory behind'
+    Assert-True (Test-Path -LiteralPath $unrelatedMarker -PathType Leaf) `
+        'update removed an unrelated bootstrap sibling'
     $settingsAfterUpdate = [System.IO.File]::ReadAllBytes($settingsPath)
     Assert-BytesEqual $settingsBeforeUpdate $settingsAfterUpdate 'workers.json'
 
@@ -103,6 +155,14 @@ finally {
     if ($temporaryRootCreated -and (Test-Path -LiteralPath $temporaryRoot)) {
         Remove-Item -LiteralPath $temporaryRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+    if ($unrelatedSiblingCreated -and (Test-Path -LiteralPath $unrelatedSibling)) {
+        Remove-Item -LiteralPath $unrelatedSibling -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if ($scriptExitCode -eq 0 -and (Test-Path -LiteralPath $temporaryRoot)) {
+    $scriptExitCode = 1
+    [Console]::Error.WriteLine('Windows bootstrap test left its project-local temporary directory behind')
 }
 
 exit $scriptExitCode

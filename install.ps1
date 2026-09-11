@@ -146,11 +146,57 @@ function Find-Git {
     return $candidatePath
 }
 
+function Get-InvokingProjectRoot {
+    $location = Get-Location
+    if ($location.Provider.Name -ne 'FileSystem') {
+        throw 'The invoking location must be on the file system.'
+    }
+
+    $directory = Get-Item -LiteralPath $location.Path -Force -ErrorAction Stop
+    if (-not $directory.PSIsContainer) {
+        throw "The invoking location is not a directory: $($location.Path)"
+    }
+    $fallback = $directory.FullName
+
+    while ($null -ne $directory) {
+        $gitPath = Join-Path $directory.FullName '.git'
+        if ((Test-Path -LiteralPath $gitPath -PathType Container) -or
+            (Test-Path -LiteralPath $gitPath -PathType Leaf)) {
+            return $directory.FullName
+        }
+        $directory = $directory.Parent
+    }
+
+    return $fallback
+}
+
 function New-BootstrapTempDirectory {
-    $name = 'delegate-workers-bootstrap-' + [guid]::NewGuid().ToString('N')
-    $path = Join-Path ([System.IO.Path]::GetTempPath()) $name
-    New-Item -ItemType Directory -Path $path | Out-Null
-    return $path
+    $projectRoot = Get-InvokingProjectRoot
+    $tmpRoot = Join-Path $projectRoot 'tmp'
+    $tmpItem = Get-Item -LiteralPath $tmpRoot -Force -ErrorAction SilentlyContinue
+    if ($null -eq $tmpItem) {
+        New-Item -ItemType Directory -Path $tmpRoot -ErrorAction Stop | Out-Null
+        $tmpItem = Get-Item -LiteralPath $tmpRoot -Force -ErrorAction Stop
+    }
+    if (-not $tmpItem.PSIsContainer) {
+        throw "Project tmp path is not a directory: $tmpRoot"
+    }
+    if (($tmpItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Refusing a reparse-point project tmp directory: $tmpRoot"
+    }
+    $expectedPath = [System.IO.Path]::GetFullPath($tmpRoot)
+    $actualPath = [System.IO.Path]::GetFullPath($tmpItem.FullName)
+    if (-not [string]::Equals($expectedPath, $actualPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Project tmp directory resolves outside the project: $tmpRoot"
+    }
+
+    $name = 'delegate-workers-install-' + [guid]::NewGuid().ToString('N')
+    $path = Join-Path $tmpItem.FullName $name
+    $tempItem = New-Item -ItemType Directory -Path $path -ErrorAction Stop
+    if (($tempItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "Created bootstrap directory is a reparse point: $path"
+    }
+    return $tempItem.FullName
 }
 
 function Add-CurrentPath {

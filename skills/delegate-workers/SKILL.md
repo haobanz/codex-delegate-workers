@@ -12,6 +12,15 @@ and it does not force delegation.
 Keep the main agent's own model and reasoning effort unchanged; never copy worker
 settings into the main session.
 
+## 临时文件规范
+
+主代理和所有子代理的临时文件、草稿、日志、截图、下载和测试数据，统一
+放在当前项目根目录的 `tmp/`；不存在时先创建，从子目录工作时也使用同一
+位置。使用能识别用途的独立子目录，并在委派时传递其绝对路径。临时命令
+显式指定目录，必要时仅为该命令设置 `TMPDIR`、`TMP`、`TEMP`；不要使用
+系统 `/tmp`、`/var/tmp` 或系统 `%TEMP%`。无法创建或写入时报告问题，不
+回退到系统临时目录。不要提交临时产物，只清理本次创建的内容。
+
 ## Presets and preflight
 
 Read [workers.json](workers.json), or run

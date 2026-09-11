@@ -6,7 +6,7 @@
 
 新安装默认启用模型偏好：新 Codex 会话在分派工作时会读取执行预设，无需每次输入技能名。是否分派、任务怎么拆、用哪个模型、并行多少、是否重试或继续分派，都由主代理根据任务判断；用户明确指定的分工、模型、强度和范围优先。
 
-`0.6.0` 保留无固定并发数、重试次数、升级链和任务记录的边界，并增加显式的项目级 `AGENTS.md` 委派规则。新版兼容读取旧配置，保留用户的模型与思考强度，不会为通过预检或项目初始化而自动换模型或 fallback。
+`0.6.1` 增加项目临时文件规范：主代理和子代理统一使用项目根目录的 `tmp/`，安装下载和测试也使用该位置。保留显式的项目级 `AGENTS.md` 委派规则，以及无固定并发数、重试次数、升级链和任务记录的边界。新版兼容读取旧配置，保留用户的模型与思考强度，不会为通过预检或项目初始化而自动换模型或 fallback。
 
 ## 环境要求
 
@@ -275,6 +275,10 @@ Windows 短命令默认位于 `%LOCALAPPDATA%\Programs\DelegateWorkers\bin`，�
 
 ## 本地开发与测试
 
+临时文件统一放在项目根目录的 `tmp/`，不存在时自动创建；安装或更新从 Git 子目录运行时使用最近的仓库 / worktree 根，没有 Git 根时使用运行命令的当前目录。请先进入项目再运行安装或更新。各次下载、测试使用独立子目录并清理自身内容，目录不可用时直接报错，不回退到系统临时目录。本仓库已忽略 `tmp/`；在其他项目也不要提交临时产物。
+
+这条规范同时写入 Skill、全局默认规则和项目规则模板。升级会更新已开启的全局默认规则；已初始化的项目需在各自目录运行 `dw project sync` 更新规则，然后重开 Codex 会话。工具内部用于原子替换的短暂文件和安装事务暂存仍紧邻目标文件，并在事务结束时清理，避免跨磁盘替换失败；它们不使用系统临时目录。
+
 从源码安装：
 
 ```bash
@@ -290,7 +294,7 @@ Windows 从源码安装：
 Windows 隔离安装及测试：
 
 ```powershell
-.\install.ps1 -Source . -CodexHome "$env:TEMP\delegate-workers-demo" -NoPath
+.\install.ps1 -Source . -CodexHome "$PWD\tmp\delegate-workers-demo" -NoPath
 py -3 -X utf8 -m unittest discover -s tests -v
 .\tests\windows_bootstrap.ps1
 ```
@@ -299,8 +303,8 @@ py -3 -X utf8 -m unittest discover -s tests -v
 
 ```bash
 python3 skills/delegate-workers/scripts/manage.py \
-  --codex-home /tmp/delegate-workers-demo --source . install
-/tmp/delegate-workers-demo/bin/dw
+  --codex-home ./tmp/delegate-workers-demo --source . install
+./tmp/delegate-workers-demo/bin/dw
 ```
 
 运行验证：

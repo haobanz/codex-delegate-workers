@@ -1,8 +1,10 @@
 import importlib.util
 import json
-import tempfile
 import unittest
 from pathlib import Path
+
+
+from temp_support import temporary_directory
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,7 +53,7 @@ class CapabilityTests(unittest.TestCase):
                 capabilities.validate_capabilities(value)
 
     def test_duplicate_json_fields_are_rejected_at_read_boundary(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory() as directory:
             path = Path(directory) / "capabilities.json"
             for content in (
                 '{"version": 1, "version": 1, "source": "x", "models": {"m": ["low"]}}',

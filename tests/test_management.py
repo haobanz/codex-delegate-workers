@@ -6,10 +6,12 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+
+from temp_support import temporary_directory
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,7 +25,7 @@ sys.path.pop(0)
 
 class ManagementTests(unittest.TestCase):
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="delegate-lifecycle-")
+        self.temporary = temporary_directory(prefix="delegate-lifecycle-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name).resolve()
         self.source = self.root / "source"
@@ -472,10 +474,43 @@ class ManagementTests(unittest.TestCase):
     def test_failed_download_preserves_installation(self):
         self.install()
         old = (self.installation.skill / manage.RECEIPT).read_bytes()
-        with patch.object(manage, "run_git", side_effect=manage.ManagementError("offline")):
+        project = self.root / "project"
+        (project / ".git").mkdir(parents=True)
+        temporary = project / "tmp"
+        temporary.mkdir()
+        sentinel = temporary / "other-task.txt"
+        sentinel.write_text("keep", encoding="utf-8")
+        def fail_download(arguments):
+            destination = Path(arguments[-1])
+            self.assertEqual(destination.parent.parent, temporary)
+            destination.mkdir()
+            (destination / "partial-download").write_text("partial", encoding="utf-8")
+            raise manage.ManagementError("offline")
+        with patch.object(manage, "run_git", side_effect=fail_download), \
+                patch.object(Path, "cwd", return_value=project):
             with self.assertRaises(manage.ManagementError):
                 self.installation.install()
         self.assertEqual((self.installation.skill / manage.RECEIPT).read_bytes(), old)
+        self.assertEqual(list(temporary.iterdir()), [sentinel])
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
+
+    def test_download_install_cleans_project_temp_after_success(self):
+        project = self.root / "project"
+        nested = project / "src"
+        nested.mkdir(parents=True)
+        (project / ".git").mkdir()
+        destinations = []
+        def local_download(arguments):
+            destination = Path(arguments[-1])
+            self.assertEqual(destination.parent.parent, project / "tmp")
+            destinations.append(destination)
+            shutil.copytree(self.source, destination)
+        with patch.object(manage, "run_git", side_effect=local_download), \
+                patch.object(Path, "cwd", return_value=nested):
+            self.assertEqual(self.installation.install()["result"], "installed")
+        self.assertEqual(len(destinations), 1)
+        self.assertFalse(destinations[0].exists())
+        self.assertEqual(list((project / "tmp").iterdir()), [])
 
     def test_short_command_runs_from_path(self):
         self.install()

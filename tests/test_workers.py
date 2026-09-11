@@ -6,10 +6,12 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from unittest.mock import patch
 from pathlib import Path
+
+
+from temp_support import temporary_directory
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -80,7 +82,7 @@ class WorkerTests(unittest.TestCase):
             workers.resolve(self.config, model="gpt-5.5", effort="high", capabilities=catalog)
 
     def test_cli_validate_loads_explicit_capabilities_once_for_all_profiles(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory() as directory:
             path = Path(directory) / "capabilities.json"
             path.write_text(json.dumps({
                 "version": 1,
@@ -144,7 +146,7 @@ class WorkerTests(unittest.TestCase):
             workers.resolve(self.config, profile="missing")
 
     def test_cli_does_not_read_or_write_main_session_config(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory() as directory:
             root = Path(directory)
             session = root / "config.toml"
             original = b'model = "user-choice"\nmodel_reasoning_effort = "xhigh"\n'
@@ -156,7 +158,7 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(session.read_bytes(), original)
 
     def test_invalid_json_returns_structured_error(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory() as directory:
             path = Path(directory) / "workers.json"
             for content in ('{"version": 1, "version": 2}', '{invalid', 'null'):
                 with self.subTest(content=content):
@@ -167,7 +169,7 @@ class WorkerTests(unittest.TestCase):
                     self.assertIn("error", json.loads(result.stderr))
 
     def test_show_reads_incompatible_config_but_validate_fails(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory() as directory:
             config_path = Path(directory) / "workers.json"
             config = {"version": 2, "default_profile": "default", "profiles": {
                 "default": {"model": "gpt-5.6-luna", "reasoning_effort": "ultra"}}}
@@ -184,7 +186,7 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(config_path.read_bytes(), original)
 
     def test_codex_config_is_read_only_and_keeps_toml_clean(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory() as directory:
             root = Path(directory)
             config_path = root / "workers.json"
             config_path.write_text(json.dumps(self.config), encoding="utf-8")
@@ -219,7 +221,7 @@ class WorkerTests(unittest.TestCase):
         self.assertNotIn("警告", result.stdout)
 
     def test_explicit_capabilities_cli_overrides_snapshot_and_rejects_missing_model(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory() as directory:
             root = Path(directory)
             config_path = root / "workers.json"
             config_path.write_text(json.dumps(self.config), encoding="utf-8")
@@ -246,7 +248,7 @@ class WorkerTests(unittest.TestCase):
             self.assertIn("error", json.loads(missing.stderr))
 
     def test_capabilities_cli_errors_are_structured(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with temporary_directory() as directory:
             path = Path(directory) / "capabilities.json"
             path.write_text('{"version": 1, "source": "bad", "models": {}}', encoding="utf-8")
             result = subprocess.run([sys.executable, str(SCRIPT), "--capabilities", str(path), "validate"],
