@@ -113,6 +113,50 @@ When the host supports it, pass the requested worker `model` and
 `reasoning_effort` explicitly and use the actual tool schema. A preset is a
 preference, not proof that the host accepted or ran that model.
 
+### Worker continuation and model consistency
+
+Treat the selected model/effort as applying to subsequent worker turns, not just
+the first spawn. An authorized change of target is a new explicit dispatch
+choice; accidental recovery inheritance is not such a choice. A completed turn
+is not necessarily a closed agent: a live or
+idle worker can continue normally when the host preserves its configuration.
+Before reusing a worker after closure, restoration, or a lost connection, check
+the actual lifecycle state and the current tool's semantics. A matching agent
+ID, an earlier spawn, or a successful `Sent input` response proves neither the
+current model nor its reasoning effort. Text in `send_input` / `send_message`
+does not set either parameter.
+
+Do not reopen a closed worker through `resume_agent` (or an equivalent follow-up
+that implicitly reopens it) when that path cannot explicitly retain/set the
+selected pair and provide fresh evidence. Create a new worker with explicit
+`model` and `reasoning_effort` instead; use the host's supported minimal-context
+fork when overrides cannot be combined with a full-history fork. Hand over only
+the objective, current changes, remaining work, file boundary, and relevant test
+results. Do not change the main model or global defaults to influence recovery.
+
+When the host exposes runtime metadata, check the first turn and every new
+continuation's fresh model/effort record, tied to the actual agent ID and turn
+or timestamp. For local session logs, inspect the relevant worker's
+`turn_context`, not unrelated sessions or just its initial record. If metadata
+appears only after starting a turn, use a check-only handoff before assigning
+implementation after a risky reopen/replacement. Missing or stale metadata is
+unverified, not a match. If the user requires verification before execution and
+the host cannot provide it, explain that limitation and ask for an alternative;
+ordinary preset use does not require a new approval or an audit file.
+
+On a recorded mismatch, stop dispatching work to that worker and interrupt/close
+it with the available host tool. Confirm it has stopped before giving another
+worker the same writable files. If stopping cannot be confirmed, report the
+limitation and keep overlapping writes on hold; independent work may continue.
+Preserve and review existing changes, then
+create a replacement with the intended pair if still available; never try to
+repair a model mismatch by repeating its name in task text. Report requested
+and observed pairs, the affected continuation, and work done by the main agent
+separately. A later matching turn does not erase an earlier mismatch. Session
+metadata records configuration; it does not independently attest an upstream
+provider's physical model identity. These checks add no fixed retry loop,
+concurrency cap, scheduler, or mandatory ledger.
+
 At handoff, report the real agent/thread id only when the tool provides one, the
 requested model and effort, changed files, tests run, and any unverified items.
 If the host does not report the actual model identity, do not claim that identity
