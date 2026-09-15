@@ -23,7 +23,9 @@ SPEC.loader.exec_module(manage)
 sys.path.pop(0)
 
 
-class ManagementTests(unittest.TestCase):
+class _InstallationHarness:
+    """共享的临时 home / 假源码夹具；仅供各 TestCase 混入，不单独收集。"""
+
     def setUp(self):
         self.temporary = temporary_directory(prefix="delegate-lifecycle-")
         self.addCleanup(self.temporary.cleanup)
@@ -773,6 +775,413 @@ class ManagementTests(unittest.TestCase):
             with self.installation.user_path_transaction({"path_entry_added": True}, remove=True):
                 pass
         self.assertEqual(state[0], (original, 2))
+
+
+class ManagementTests(_InstallationHarness, unittest.TestCase):
+    pass
+
+
+class InterfaceLifecycleTests(_InstallationHarness, unittest.TestCase):
+    """安装/更新/回滚/卸载与统一接口注册的交互（全部用假 Codex CLI）。"""
+
+    def setUp(self):
+        super().setUp()
+        from test_interface_setup import write_fake_cli
+        self.fake = write_fake_cli(self.root)
+        self.installation.interface_command_provider = lambda: [sys.executable, str(self.fake)]
+
+    def tearDown(self):
+        # 本类会按测试意图注册或保留同名条目，因此只校验无关文件未被改动；
+        # 基础类的逐字节 config.toml 校验仍覆盖普通安装/更新/回滚路径。
+        self.assertEqual(self.other_skill.read_text(), "unrelated skill")
+
+    def fake_environment(self, **values):
+        for key, value in values.items():
+            previous = os.environ.get(key)
+            self.addCleanup(self.restore_environment, key, previous)
+            os.environ[key] = value
+
+    @staticmethod
+    def restore_environment(key, previous):
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
+
+    def servers(self):
+        if not self.main_config.exists():
+            return {}
+        from test_interface_setup import parse_mcp_servers
+        return parse_mcp_servers(self.main_config.read_bytes())
+
+    def interface_entry(self):
+        args = self.servers().get("delegate-workers", {}).get("args")
+        return args
+
+    def test_enable_and_disable_are_idempotent_and_report_restart(self):
+        self.install()
+        for name, expected, restart in (("enable", "enabled", True), ("enable", "already_enabled", True),
+                                        ("disable", "disabled", False),
+                                        ("disable", "already_disabled", False)):
+            result = self.installation.interface_enable() if name == "enable" \
+                else self.installation.interface_disable()
+            self.assertEqual(result["result"], expected, result)
+            self.assertEqual(result["restart_required"], restart, result)
+        self.assertNotIn("delegate-workers", self.servers())
+        self.assertNotIn(b"delegate-workers", self.main_config.read_bytes())
+
+    def assert_environment_untouched(self):
+        self.assertEqual(self.main_config.read_bytes(), self.main_bytes)
+        self.assertEqual(self.other_skill.read_text(), "unrelated skill")
+
+    def test_install_and_update_never_touch_config_toml(self):
+        before = self.main_config.read_bytes()
+        self.install()
+        self.assertEqual(self.main_config.read_bytes(), before)
+        self.assertIsNone(self.interface_entry())
+        self.assertFalse((self.home / "delegate-workers-interface.json").exists())
+        self.release("9.9.9")
+        self.install()
+        self.assertEqual(self.main_config.read_bytes(), before)
+
+    def test_update_keeps_enabled_entry_working_at_same_script_path(self):
+        self.install()
+        enabled = self.installation.interface_enable()
+        self.assertEqual(enabled["result"], "enabled")
+        args_before = self.interface_entry()
+        self.assertEqual(args_before[2], str(self.installation.skill / "scripts/mcp_server.py"))
+        self.release("9.9.9")
+        self.assertEqual(self.install()["result"], "updated")
+        self.assertEqual(self.interface_entry(), args_before)
+        self.assertEqual(self.installation.interface_status()["interface"]["state"], "registered")
+        self.assertTrue(Path(args_before[2]).is_file())
+
+    def test_update_reports_enabled_entry_and_keeps_marker(self):
+        self.install()
+        self.installation.interface_enable()
+        marker = (self.home / "delegate-workers-interface.json").read_bytes()
+        self.release("9.9.9")
+        self.install()
+        self.assertEqual((self.home / "delegate-workers-interface.json").read_bytes(), marker)
+
+    def test_status_stays_usable_without_codex_and_never_calls_cli(self):
+        self.install()
+        calls = []
+        original = manage.interface_setup.resolve_codex_command
+
+        def record(*arguments, **keywords):
+            calls.append(arguments)
+            return original(*arguments, **keywords)
+
+        with patch.object(manage.interface_setup, "resolve_codex_command", side_effect=record):
+            status = self.installation.status()
+        self.assertTrue(status["installed"])
+        self.assertEqual(status["interface"]["state"], "unknown")
+        self.assertFalse(status["interface"]["marker_present"])
+        self.assertEqual(calls, [])
+
+    def test_rollback_between_interface_versions_keeps_registration(self):
+        self.install()
+        self.release("9.9.9")
+        self.install()
+        self.installation.interface_enable()
+        args = self.interface_entry()
+        self.assertEqual(self.installation.rollback()["version"], self.source_version)
+        self.assertEqual(self.interface_entry(), args)
+        self.assertEqual(self.installation.interface_status()["interface"]["state"], "registered")
+        self.assertTrue(Path(args[2]).is_file())
+
+    def test_legacy_rollback_is_refused_before_mutation_when_entry_is_enabled(self):
+        legacy = self.legacy_source()
+        self.assertEqual(self.installation.install(legacy)["version"], "0.4.0")
+        self.assertEqual(self.install()["result"], "updated")
+        self.installation.interface_enable()
+        args = self.interface_entry()
+        receipt = (self.installation.skill / manage.RECEIPT).read_bytes()
+        with self.assertRaises(manage.ManagementError) as caught:
+            self.installation.rollback()
+        self.assertIn("dw interface disable", str(caught.exception))
+        self.assertEqual((self.installation.skill / manage.RECEIPT).read_bytes(), receipt)
+        self.assertEqual(self.interface_entry(), args)
+        self.assertEqual(self.installation.interface_disable()["result"], "disabled")
+        self.assertNotIn("delegate-workers", self.servers())
+        self.assertEqual(self.installation.rollback()["version"], "0.4.0")
+        self.assertNotIn("scripts/interface_setup.py", (self.installation.skill / "scripts").iterdir().__str__())
+
+    def test_rollback_to_legacy_keeps_disabled_entry_and_marker(self):
+        legacy = self.legacy_source()
+        self.installation.install(legacy)
+        self.install()
+        self.installation.interface_enable()
+        text = self.main_config.read_text(encoding="utf-8")
+        self.main_config.write_text(text + "enabled = false\n", encoding="utf-8")
+        disabled = self.main_config.read_bytes()
+        self.assertEqual(self.installation.rollback()["version"], "0.4.0")
+        self.assertEqual(self.main_config.read_bytes(), disabled)
+        self.assertTrue((self.home / "delegate-workers-interface.json").is_file())
+
+    def test_uninstall_removes_owned_registration_before_deleting_installed_code(self):
+        self.install()
+        self.installation.interface_enable()
+        script = Path(self.interface_entry()[2])
+        result = self.installation.uninstall()
+        self.assertEqual(result["result"], "uninstalled")
+        self.assertFalse(self.installation.skill.exists())
+        self.assertNotIn("delegate-workers", self.servers())
+        self.assertFalse((self.home / "delegate-workers-interface.json").exists())
+        self.assertFalse(script.exists())
+        self.assert_environment_untouched()
+
+    def test_uninstall_refuses_when_registration_cannot_be_cleaned(self):
+        self.install()
+        self.installation.interface_enable()
+        args = self.interface_entry()
+        self.fake_environment(FAKE_CODEX_FAIL="remove")
+        with self.assertRaises(manage.ManagementError) as caught:
+            self.installation.uninstall()
+        self.assertIn("无法删除本工具的 MCP 条目", str(caught.exception))
+        self.assertTrue(self.installation.skill.is_dir())
+        self.assertEqual(self.interface_entry(), args)
+        self.assertTrue(Path(args[2]).is_file())
+
+    def test_uninstall_refuses_when_codex_cannot_be_located(self):
+        self.install()
+        self.installation.interface_enable()
+        self.installation.interface_command_provider = lambda: (_ for _ in ()).throw(
+            ValueError("未找到可用的 Codex CLI 可执行文件"))
+        with self.assertRaises(manage.ManagementError) as caught:
+            self.installation.uninstall()
+        self.assertIn("无法确认统一接口条目已清理", str(caught.exception))
+        self.assertTrue(self.installation.skill.is_dir())
+
+    def test_uninstall_without_registration_never_calls_codex(self):
+        # 从未启用过且 CLI 不可用：普通离线卸载仍然可用，不触碰任何注册。
+        self.install()
+        self.installation.interface_command_provider = lambda: (_ for _ in ()).throw(
+            ValueError("未找到可用的 Codex CLI 可执行文件"))
+        before = self.main_config.read_bytes()
+        self.assertEqual(self.installation.uninstall()["result"], "uninstalled")
+        self.assertEqual(self.main_config.read_bytes(), before)
+        self.assertFalse((self.home / "delegate-workers-interface.json").exists())
+
+    def test_uninstall_without_registration_keeps_foreign_config_when_cli_is_available(self):
+        # CLI 可用时即使从未启用也会核对注册；核对本身不得改动无关配置。
+        self.install()
+        self.main_config.write_bytes(self.main_bytes + b'\n[mcp_servers.other]\n'
+                                                       b'command = "othercmd"\nargs = ["a"]\n')
+        before = self.main_config.read_bytes()
+        self.assertEqual(self.installation.uninstall()["result"], "uninstalled")
+        self.assertEqual(self.main_config.read_bytes(), before)
+
+    def test_uninstall_preserves_foreign_same_name_entry(self):
+        self.install()
+        self.main_config.write_bytes(self.main_bytes + b'\n[mcp_servers.delegate-workers]\n'
+                                                       b'command = "other-tool"\nargs = ["serve"]\n')
+        foreign = self.main_config.read_bytes()
+        self.assertEqual(self.installation.uninstall()["result"], "uninstalled")
+        self.assertEqual(self.main_config.read_bytes(), foreign)
+        self.assertFalse((self.home / "delegate-workers-interface.json").exists())
+
+    def test_partial_interface_candidate_is_rejected_without_state_changes(self):
+        self.install()
+        runtime = ("scripts/cli_support.py", "scripts/worker_runtime.py", "scripts/mcp_server.py",
+                   "scripts/interface_setup.py")
+        for relative in runtime:
+            with self.subTest(relative=relative):
+                before = self.installation_snapshot()
+                probe = self.root / "probe"
+                if probe.exists():
+                    shutil.rmtree(probe)
+                shutil.copytree(self.source / "skills/delegate-workers", probe / "skills/delegate-workers")
+                target = probe / "skills/delegate-workers" / relative
+                if target.exists():
+                    target.unlink()
+                self.release("9.9.probe")
+                with self.assertRaises(manage.ManagementError):
+                    self.installation.apply(probe / "skills/delegate-workers")
+                self.assert_installation_snapshot(before)
+                self.assertFalse(self.installation.backups.exists())
+
+    def test_menu_option_seven_enables_and_reports_status(self):
+        self.install()
+        replies = io.StringIO("7\n1\n7\n3\n0\n")
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            manage.menu(self.installation, self.source, replies)
+        rendered = output.getvalue()
+        self.assertIn("统一接口", rendered)
+        self.assertIn("已启用", rendered)
+        self.assertIn("delegate-workers", self.servers())
+        self.assertEqual(self.installation.interface_status()["interface"]["state"], "registered")
+
+    def test_menu_option_seven_disable_requires_confirmation(self):
+        self.install()
+        self.installation.interface_enable()
+        replies = io.StringIO("7\n2\n取消\n7\n2\n停用\n0\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            manage.menu(self.installation, self.source, replies)
+        self.assertNotIn("delegate-workers", self.servers())
+
+    def test_receipt_rejects_non_boolean_interface_history(self):
+        self.install()
+        receipt_path = self.installation.skill / manage.RECEIPT
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["interface_ever_enabled"] = "true"
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        with self.assertRaises(manage.ManagementError) as caught:
+            manage.load_receipt(self.installation.skill)
+        self.assertIn("启用历史", str(caught.exception))
+
+    def test_enabled_history_survives_disable_and_update_without_touching_models(self):
+        self.install()
+        self.installation.configure("default", "custom/model", "low")
+        settings = (self.installation.skill / "workers.json").read_bytes()
+        self.assertEqual(self.installation.interface_enable()["result"], "enabled")
+        enabled_receipt = json.loads((self.installation.skill / manage.RECEIPT).read_text(encoding="utf-8"))
+        self.assertIs(enabled_receipt["interface_ever_enabled"], True)
+        self.assertEqual(self.installation.interface_disable()["result"], "disabled")
+        disabled_receipt = json.loads((self.installation.skill / manage.RECEIPT).read_text(encoding="utf-8"))
+        self.assertIs(disabled_receipt["interface_ever_enabled"], True)
+        self.assertEqual(self.installation.interface_disable()["result"], "already_disabled")
+        self.assertEqual(self.interface_entry(), None)
+        self.release("9.9.9")
+        self.assertEqual(self.install()["result"], "updated")
+        updated_receipt = json.loads((self.installation.skill / manage.RECEIPT).read_text(encoding="utf-8"))
+        self.assertIs(updated_receipt["interface_ever_enabled"], True)
+        self.assertEqual((self.installation.skill / "workers.json").read_bytes(), settings)
+
+    def test_markerless_owned_entry_is_removed_on_uninstall_with_flag(self):
+        self.install()
+        self.installation.interface_enable()
+        (self.home / "delegate-workers-interface.json").unlink()
+        self.assertEqual(self.installation.uninstall()["result"], "uninstalled")
+        self.assertNotIn("delegate-workers", self.servers())
+        self.assertFalse(self.installation.skill.exists())
+
+    def test_markerless_owned_entry_is_removed_on_uninstall_without_flag(self):
+        # 旧安装可能注册过却没有启用历史：只要 CLI 可用就必须核对并清理。
+        self.install()
+        self.installation.interface_enable()
+        (self.home / "delegate-workers-interface.json").unlink()
+        receipt_path = self.installation.skill / manage.RECEIPT
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt.pop("interface_ever_enabled", None)
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        args = self.interface_entry()
+        self.assertEqual(self.installation.uninstall()["result"], "uninstalled")
+        self.assertNotIn("delegate-workers", self.servers())
+        self.assertFalse(Path(args[2]).exists())
+
+    def test_uninstall_refuses_markerless_entry_offline_after_recorded_enable(self):
+        self.install()
+        self.installation.interface_enable()
+        args = self.interface_entry()
+        (self.home / "delegate-workers-interface.json").unlink()
+        self.installation.interface_command_provider = lambda: (_ for _ in ()).throw(
+            ValueError("未找到可用的 Codex CLI 可执行文件"))
+        with self.assertRaises(manage.ManagementError) as caught:
+            self.installation.uninstall()
+        message = str(caught.exception)
+        self.assertIn("曾被启用", message)
+        self.assertIn("标记文件已缺失", message)
+        self.assertIn("不要通过删除标记文件绕过清理", message)
+        self.assertNotIn("删除标记文件 delegate-workers-interface.json 再卸载", message)
+        self.assertTrue(self.installation.skill.is_dir())
+        self.assertEqual(self.interface_entry(), args)
+
+    def test_uninstall_refuses_markerless_entry_when_listing_fails(self):
+        self.install()
+        self.installation.interface_enable()
+        args = self.interface_entry()
+        (self.home / "delegate-workers-interface.json").unlink()
+        self.fake_environment(FAKE_CODEX_FAIL="list")
+        with self.assertRaises(manage.ManagementError) as caught:
+            self.installation.uninstall()
+        self.assertIn("无法确认", str(caught.exception))
+        self.assertTrue(self.installation.skill.is_dir())
+        self.assertEqual(self.interface_entry(), args)
+
+    def test_legacy_target_refuses_markerless_enabled_entry_offline(self):
+        legacy = self.legacy_source()
+        self.install()
+        self.installation.interface_enable()
+        args = self.interface_entry()
+        (self.home / "delegate-workers-interface.json").unlink()
+        self.installation.interface_command_provider = lambda: (_ for _ in ()).throw(
+            ValueError("未找到可用的 Codex CLI 可执行文件"))
+        version = self.installation.status()["version"]
+        with self.assertRaises(manage.ManagementError) as caught:
+            self.installation.install(legacy, require_existing=True)
+        message = str(caught.exception)
+        self.assertIn("曾被启用", message)
+        self.assertIn("标记文件已缺失", message)
+        self.assertEqual(self.installation.status()["version"], version)
+        self.assertEqual(self.interface_entry(), args)
+        self.assertFalse(self.installation.backups.exists())
+
+    def test_legacy_target_refuses_markerless_enabled_entry_when_cli_is_available(self):
+        legacy = self.legacy_source()
+        self.install()
+        self.installation.interface_enable()
+        args = self.interface_entry()
+        (self.home / "delegate-workers-interface.json").unlink()
+        with self.assertRaises(manage.ManagementError) as caught:
+            self.installation.install(legacy, require_existing=True)
+        self.assertIn("dw interface disable", str(caught.exception))
+        self.assertEqual(self.interface_entry(), args)
+        self.assertTrue(self.installation.skill.is_dir())
+
+    def test_legacy_target_still_checks_foreign_markerless_entry(self):
+        legacy = self.legacy_source()
+        self.install()
+        self.main_config.write_bytes(self.main_bytes + b'\n[mcp_servers.delegate-workers]\n'
+                                                       b'command = "other-tool"\nargs = ["serve"]\n')
+        foreign = self.main_config.read_bytes()
+        self.assertEqual(self.installation.install(legacy, require_existing=True)["version"], "0.4.0")
+        self.assertEqual(self.main_config.read_bytes(), foreign)
+
+    def test_staged_candidate_with_broken_mcp_import_is_rejected(self):
+        self.install()
+        self.installation.configure("default", "custom/model", "low")
+        settings = (self.installation.skill / "workers.json").read_bytes()
+        candidate = self.source_skill / "scripts/mcp_server.py"
+        candidate.write_text(candidate.read_text(encoding="utf-8").replace(
+            "import cli_support  # noqa: E402", "import module_that_does_not_exist  # noqa: E402"),
+            encoding="utf-8")
+        self.release("9.9.mcp")
+        before = self.installation_snapshot()
+        with self.assertRaises(manage.ManagementError) as caught:
+            self.install()
+        self.assertIn("MCP", str(caught.exception))
+        self.assert_installation_snapshot(before)
+        self.assertEqual((self.installation.skill / "workers.json").read_bytes(), settings)
+        self.assertFalse(self.installation.backups.exists())
+
+    def test_uninstall_reports_partial_registration_removal_when_cleanup_fails(self):
+        self.install()
+        self.installation.interface_enable()
+        launchers = set(self.installation.launchers())
+        original_unlink = Path.unlink
+
+        def fail_launchers(path, *arguments, **keywords):
+            if path in launchers:
+                raise OSError("simulated launcher removal failure")
+            return original_unlink(path, *arguments, **keywords)
+
+        with patch.object(Path, "unlink", fail_launchers):
+            with self.assertRaises(manage.ManagementError) as caught:
+                self.installation.uninstall()
+        message = str(caught.exception)
+        self.assertIn("统一接口条目已删除", message)
+        self.assertNotIn("全部回退", message)
+        self.assertNotIn("delegate-workers", self.servers())
+        self.assertTrue(self.installation.skill.is_dir())
+
+    def test_interface_status_does_not_require_installation(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = self.installation.interface_status()
+        self.assertEqual(status["interface"]["state"], "absent")
+        self.assertFalse((self.home / "delegate-workers-interface.json").exists())
+        self.assert_environment_untouched()
 
 
 if __name__ == "__main__":

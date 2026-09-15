@@ -113,6 +113,103 @@ When the host supports it, pass the requested worker `model` and
 `reasoning_effort` explicitly and use the actual tool schema. A preset is a
 preference, not proof that the host accepted or ran that model.
 
+### Dispatch availability and route selection
+
+Before claiming that dispatch is unavailable, inspect the currently enabled tool
+schema or inventory and any documented discovery path. Separate conditions stay
+separate: the dispatch tool is absent; the interface rejected the requested
+model; a provider, auth, or network error occurred; runtime identity metadata is
+missing; or an unrelated business tool (a spreadsheet or browser connection,
+for example) is disconnected. None of these implies another, and a stale
+runtime snapshot is not an account-wide denial of a model.
+
+Route selection is not a fixed retry or fallback chain, and local static checks
+(`list_models`, compatibility preflight, inspection of available routes) do not
+contact a provider or prove authentication. A request that was rejected before
+dispatch and a job that already started and then failed are different cases:
+inspect the existing agent's state and failure reason before any new dispatch,
+and do not assume a same-provider failure becomes a success merely because the
+work is rerouted through a direct CLI call. No retry, replacement worker, or
+broader approval is required by this section. Native dispatch remains allowed
+and useful whenever it accepts the requested pair.
+
+### Enabled Delegate Workers MCP interface
+
+Inspect the tools actually exposed in the current session. Use native dispatch
+when it accepts the requested pair. When it cannot, and Delegate Workers' own MCP
+server `delegate-workers` is enabled and its tools are visible, prefer it over
+improvising a CLI invocation: call `list_models` with the project `cwd` to
+read the configured preferences and the effective selection source, then
+`spawn_agent` with the current user or project model and effort, `get_agent` to
+poll status, and `cancel_agent` when the work must stop. `list_models` reports
+configured preferences only, not a provider-wide catalog, so absence of a model
+there is not evidence that the account lacks it.
+
+Pass the requested pair explicitly when the caller specified a model and effort:
+an explicit `model` requires an explicit `reasoning_effort`, and an explicit
+`profile` may be used instead. Keep `sandbox` at its `read-only` default unless
+the task genuinely edits code or files, and treat `writable_files` as the
+handoff's boundary description rather than a per-file enforcement mechanism.
+Each `spawn_agent` call is a fresh independent process: the MVP has no resume
+tool, so continue work by spawning again with a bounded handoff instead of
+assuming an existing session can be reopened. This only avoids the implicit
+resume path; it does not guarantee the absence of runtime drift, so consistency
+still rests on whatever per-turn metadata the host provides and is unverified
+when that metadata is missing. The adapter's `agent_id` is not the backend CLI
+session id; report whichever identifiers the tools actually return and keep
+requested versus observed values separate.
+
+If the server or its tools are absent from the current session, do not install,
+register, or change global settings during an ordinary task; report the concrete
+limitation and let the user decide whether to enable it. The exact local Codex
+CLI route below remains available within existing authorization.
+
+### Local Codex CLI route
+
+The current user or project selection decides the model and effort; an example
+quoted from earlier work never overrides it. A request rejected by native
+dispatch only means that host interface will not take it; it does not show the
+model is unavailable, so the original id may still be attempted through an
+enabled MCP interface or an already available local Codex CLI within existing
+authorization. Whether that attempt succeeds depends on the installed CLI
+version and provider support, and no route guarantees execution just because it
+is tried. Verify the installed CLI's real help and features before using them,
+pass the requested model and effort explicitly to the child, and keep the main
+session's model and effort unchanged. Do not silently substitute a model or
+provider, edit global configuration, request an API key, or install anything
+just for this route. A check-only, read-only invocation can probe whether the
+route works before real work is assigned.
+
+The MCP adapter and an independent CLI worker are both their own processes, not
+native agents. Report the `agent_id` or session id that path actually returns,
+if it returns one, and never present a borrowed or parent id as the worker's.
+The session header records the requested configuration and a successful response
+shows the route worked; neither attests the upstream provider's physical model
+identity.
+
+Check that the chosen route actually exposes the tools and files the task needs:
+a CLI worker may lack a business tool connection the main session has, such as a
+spreadsheet or browser integration. Tool exposure cannot be fabricated,
+promised, or created by rewording instructions. Where a task needs retried or
+batched transport reads, verify that the intended coverage is complete instead
+of assuming success; keep that requirement generic, without hardcoded record
+ranges or chunk sizes, and without claiming to fix the upstream tool.
+
+When an explicit division of labor or an applicable project rule requires a
+particular model/effort and no authorized route can execute it, pause only the
+blocked execution, state the precise limitation, and ask for an alternative. The
+main agent may continue planning and run the minimum diagnostics needed to
+locate the blocker, but it must not perform the assigned business task under
+labels such as "read-only investigation", "retry", or "fallback"; disclosing a
+limitation is not authorization to replace the worker. An existing explicit
+approval for main-agent takeover can be used without asking again. Reporting
+requested versus observed metadata and main-agent work separately does not
+itself authorize takeover. "Independent work may continue" means work inside the
+already authorized division of labor, not the blocked assignment. Optional
+presets keep the main agent's general autonomy: this section adds no scheduler,
+fixed retry count, concurrency cap, audit ledger, or new capability file, and
+delegation stays non-compulsory for ordinary tasks.
+
 ### Worker continuation and model consistency
 
 Treat the selected model/effort as applying to subsequent worker turns, not just
@@ -147,14 +244,15 @@ ordinary preset use does not require a new approval or an audit file.
 On a recorded mismatch, stop dispatching work to that worker and interrupt/close
 it with the available host tool. Confirm it has stopped before giving another
 worker the same writable files. If stopping cannot be confirmed, report the
-limitation and keep overlapping writes on hold; independent work may continue.
-Preserve and review existing changes, then
-create a replacement with the intended pair if still available; never try to
-repair a model mismatch by repeating its name in task text. Report requested
-and observed pairs, the affected continuation, and work done by the main agent
-separately. A later matching turn does not erase an earlier mismatch. Session
-metadata records configuration; it does not independently attest an upstream
-provider's physical model identity. These checks add no fixed retry loop,
+limitation and keep overlapping writes on hold; work inside the already
+authorized division of labor may continue. Preserve and review existing changes,
+then create a replacement with the intended pair if still available; never
+attempt to repair a model mismatch by repeating its name in task text. Report
+requested and observed pairs, the affected continuation, and work done by the
+main agent separately. A later matching turn does not erase an earlier
+mismatch. Session metadata records configuration; it does not independently
+attest an upstream provider's physical model identity. These checks add no
+fixed retry loop,
 concurrency cap, scheduler, or mandatory ledger.
 
 At handoff, report the real agent/thread id only when the tool provides one, the

@@ -21,6 +21,14 @@ import activation
 import platform_support
 import project_rules
 
+try:
+    import interface_setup
+except ImportError:  # pragma: no cover - 仅用于缺少新模块的异常安装
+    interface_setup = None
+
+# 缺少 interface_setup 时用空元组，避免 except 表达式本身抛出 AttributeError。
+INTERFACE_ERRORS = (interface_setup.InterfaceError,) if interface_setup is not None else ()
+
 
 PROJECT = "delegate-workers"
 REPOSITORY = "https://github.com/haobanz/codex-delegate-workers.git"
@@ -30,7 +38,14 @@ BASE_RUNTIME_REQUIRED = {"scripts/activation.py", "scripts/platform_support.py",
                          "references/default-delegation.md"}
 CAPABILITY_RUNTIME_REQUIRED = {"scripts/capabilities.py", "model-capabilities.json"}
 PROJECT_RUNTIME_REQUIRED = {"scripts/project_rules.py", "references/project-delegation.md"}
-RUNTIME_REQUIRED = BASE_RUNTIME_REQUIRED | CAPABILITY_RUNTIME_REQUIRED | PROJECT_RUNTIME_REQUIRED
+INTERFACE_RUNTIME_REQUIRED = {"scripts/cli_support.py", "scripts/worker_runtime.py",
+                              "scripts/mcp_server.py", "scripts/interface_setup.py"}
+RUNTIME_REQUIRED = (BASE_RUNTIME_REQUIRED | CAPABILITY_RUNTIME_REQUIRED | PROJECT_RUNTIME_REQUIRED
+                    | INTERFACE_RUNTIME_REQUIRED)
+INTERFACE_GUIDANCE = "dw interface disable"
+INTERFACE_MARKER = "delegate-workers-interface.json"
+# helper.state() 可能返回的已知状态；其它取值一律视为“无法确认”。
+INTERFACE_STATES = {"registered", "disabled", "absent", "changed", "conflict"}
 EFFORT_LABELS = {"low": "低", "medium": "中", "high": "高", "xhigh": "超高",
                  "max": "最大", "ultra": "极限", "minimal": "最低", "none": "关闭"}
 
@@ -46,6 +61,8 @@ def required_files_for_candidate(files):
         required |= CAPABILITY_RUNTIME_REQUIRED
     if set(files) & PROJECT_RUNTIME_REQUIRED:
         required |= PROJECT_RUNTIME_REQUIRED
+    if set(files) & INTERFACE_RUNTIME_REQUIRED:
+        required |= INTERFACE_RUNTIME_REQUIRED
     return required
 
 
@@ -149,16 +166,20 @@ def validate_staged_candidate(stage, managed_files):
             raise ManagementError(f"新版本 Python 脚本无效，已停止更新：{path.relative_to(stage)}"
                                   + (f"：{detail}" if detail else ""))
 
-    try:
-        startup = subprocess.run(
-            [sys.executable, "-X", "utf8", str(stage / "scripts/manage.py"), "--help"],
-            capture_output=True, text=True, encoding="utf-8", check=False, timeout=30)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ManagementError("新版本管理入口无法启动，已停止更新") from exc
-    if startup.returncode:
-        detail = startup.stderr.strip() or startup.stdout.strip()
-        raise ManagementError("新版本管理入口无法启动，已停止更新"
-                              + (f"：{detail}" if detail else ""))
+    entries = [(stage / "scripts/manage.py", "新版本管理入口无法启动，已停止更新")]
+    if "scripts/mcp_server.py" in set(managed_files):
+        # 采用统一接口的候选版本必须能在目录替换前导入 MCP 运行时依赖。
+        entries.append((stage / "scripts/mcp_server.py", "新版本 MCP 服务器无法启动，已停止更新"))
+    for entry, failure in entries:
+        try:
+            startup = subprocess.run(
+                [sys.executable, "-X", "utf8", str(entry), "--help"],
+                capture_output=True, text=True, encoding="utf-8", check=False, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ManagementError(failure) from exc
+        if startup.returncode:
+            detail = startup.stderr.strip() or startup.stdout.strip()
+            raise ManagementError(failure + (f"：{detail}" if detail else ""))
 
 
 def load_receipt(directory):
@@ -182,6 +203,9 @@ def load_receipt(directory):
         activation.validate_state(value["activation"])
     if "path_entry_added" in value and type(value["path_entry_added"]) is not bool:
         raise ManagementError("安装记录中的 PATH 所有权标记无效")
+    if ("interface_ever_enabled" in value
+            and type(value["interface_ever_enabled"]) is not bool):
+        raise ManagementError("安装记录中的统一接口启用历史标记无效")
     for relative, digest in value["files"].items():
         path = PurePosixPath(relative)
         if (not relative or path.is_absolute() or ".." in path.parts or "\\" in relative or ":" in relative
@@ -205,6 +229,8 @@ class Installation:
         self.command_dir = Path(bin_dir or saved_bin or default_bin).expanduser().resolve()
         if saved_bin and self.command_dir != Path(saved_bin):
             raise ManagementError("已安装版本的命令目录不能直接更改，请先卸载再选择新目录")
+        # 统一接口默认使用本机 Codex CLI；本属性只便于测试注入等价命令。
+        self.interface_command_provider = None
 
     def launchers(self):
         suffix = ".cmd" if platform_support.WINDOWS else ""
@@ -277,6 +303,176 @@ class Installation:
                 atomic_write(launcher, contents, 0o755)
             elif launcher.is_file() and launcher.read_bytes() == self.launcher_content(launcher):
                 launcher.unlink()
+
+    def interface(self):
+        """返回统一接口注册助手；缺少新模块时给出明确错误。"""
+        if interface_setup is None:
+            raise ManagementError("当前安装缺少 scripts/interface_setup.py，无法管理统一接口；"
+                                  "请先运行菜单 1 安装或更新本技能")
+        return interface_setup.InterfaceSetup(self.home, self.skill,
+                                              self.interface_command_provider)
+
+    def interface_server_present(self):
+        return (self.skill / "scripts/mcp_server.py").is_file()
+
+    def interface_summary(self):
+        """状态展示用的本地摘要：不调用 Codex CLI，也不创建任何文件。"""
+        if interface_setup is None:
+            marker = self.home / INTERFACE_MARKER
+            return {"name": PROJECT, "state": "unavailable",
+                    "state_label": "无法确认（缺少统一接口模块）",
+                    "server": str(self.skill / "scripts/mcp_server.py"),
+                    "server_present": self.interface_server_present(), "entry": None,
+                    "marker_path": str(marker), "marker_present": marker.is_file(),
+                    "detail": "当前安装缺少 scripts/interface_setup.py；请更新本技能后再管理统一接口"}
+        return self.interface().local_summary()
+
+    def interface_ever_enabled(self):
+        """本安装是否成功执行过显式启用；停用不会撤销这段历史。"""
+        receipt = load_receipt(self.skill)
+        return bool(receipt and receipt.get("interface_ever_enabled") is True)
+
+    def remember_interface_enabled(self, receipt=None):
+        """在安装记录里持久化启用历史；不写入任何模型或注册内容。"""
+        if receipt is None:
+            receipt = load_receipt(self.skill)
+        if receipt is None or receipt.get("interface_ever_enabled") is True:
+            return
+        updated = copy.deepcopy(receipt)
+        updated["interface_ever_enabled"] = True
+        atomic_write(self.skill / RECEIPT, json_bytes(updated))
+
+    def interface_state_if_available(self, helper):
+        """CLI 可用时读取真实注册状态；不可用、出错或状态未知时返回 None。"""
+        try:
+            value = helper.state()
+        except INTERFACE_ERRORS + (OSError, ValueError, subprocess.SubprocessError):
+            return None
+        if not isinstance(value, dict) or value.get("state") not in INTERFACE_STATES:
+            return None
+        return value
+
+    def guard_interface_target(self, files):
+        """更新或回滚到不含统一接口的版本前，拒绝留下已启用的注册。"""
+        if set(files) & INTERFACE_RUNTIME_REQUIRED:
+            return None
+        if not self.interface_server_present():
+            return None
+        if interface_setup is None:
+            # 缺少助手时无法向 CLI 核对；只有存在明确证据才必须拒绝。
+            if self.interface_ever_enabled() or (self.home / INTERFACE_MARKER).is_file():
+                raise ManagementError(
+                    "当前安装缺少 scripts/interface_setup.py，但存在统一接口启用的记录，"
+                    "无法确认注册是否已清理，已停止操作。请先恢复该模块，再运行 "
+                    + INTERFACE_GUIDANCE)
+            return None
+        helper = self.interface()
+        # CLI 可用时始终核对真实注册；标记缺失不能掩盖指向本安装的条目。
+        current = self.interface_state_if_available(helper)
+        if current is None:
+            # CLI 不可用：只有从未启用过（既无标记也无启用历史）才继续普通离线生命周期。
+            if helper.marker_present() or self.interface_ever_enabled():
+                raise ManagementError(self.offline_refusal("已停止操作"))
+            return None
+        if current.get("references_install") and current.get("enabled"):
+            manual = (f"若该条目由你修改过，请手工运行 codex mcp remove {PROJECT}"
+                      if not current.get("owned") else "")
+            raise ManagementError(
+                f"统一接口条目 {PROJECT} 已启用并指向本安装"
+                f"（{current.get('state_label') or '状态未知'}），而目标版本不含统一接口，"
+                f"操作后会留下失效的服务器路径。请先运行 {INTERFACE_GUIDANCE} 再重试"
+                + (f"；{manual}" if manual else ""))
+        return current
+
+    def release_interface(self):
+        """卸载前清理自己的注册；无法确认时给出明确错误。"""
+        if interface_setup is None:
+            # 缺少助手时无法核对；有证据就拒绝，从未启用过的普通安装仍可卸载。
+            if self.interface_ever_enabled() or (self.home / INTERFACE_MARKER).is_file():
+                raise ManagementError(
+                    "当前安装缺少 scripts/interface_setup.py，但存在统一接口启用的记录，"
+                    "无法确认注册是否已清理，已停止卸载。请先恢复该模块，再运行 "
+                    + INTERFACE_GUIDANCE + " 后重试")
+            return {"result": "unknown_module"}
+        helper = self.interface()
+        # 服务器脚本还在，CLI 可用就核对真实注册状态，即使标记已缺失。
+        current = self.interface_state_if_available(helper)
+        if current is None:
+            # CLI 不可用：只有从未启用过（既无标记也无启用历史）才继续普通离线卸载。
+            if helper.marker_present() or self.interface_ever_enabled():
+                raise ManagementError(self.offline_refusal("已停止卸载"))
+            return {"result": "unavailable_not_registered"}
+        return self.release_owned_interface(current)
+
+    def offline_refusal(self, action):
+        """无法核对时说明启用历史，不把删除标记当作绕过清理的办法。"""
+        helper = self.interface()
+        if self.interface_ever_enabled() and not helper.marker_present():
+            reason = ("安装记录显示统一接口曾被启用，但标记文件已缺失且本地 Codex CLI 不可用，"
+                      "无法确认注册是否已清理")
+        else:
+            reason = "无法确认统一接口条目已清理（本地 Codex CLI 或标记文件不可用）"
+        return (f"{reason}，{action}。请先恢复本地 Codex CLI，再运行 {INTERFACE_GUIDANCE} 后重试；"
+                "不要通过删除标记文件绕过清理")
+
+    def release_owned_interface(self, current):
+        """按真实注册状态清理：本工具拥有的条目会被移除，其余保持原样。"""
+        helper = self.interface()
+        state = current.get("state")
+        if state == "absent":
+            helper.remove_marker()
+            return {"result": "absent"}
+        if current.get("owned"):
+            # owned 表示条目内容等于本安装的注册：用助手自身的停用路径安全删除。
+            try:
+                helper.disable()
+            except INTERFACE_ERRORS as exc:
+                raise ManagementError(f"无法删除本工具的 MCP 条目，已停止卸载：{exc}。"
+                                      f"请先运行 {INTERFACE_GUIDANCE} 或手工运行 "
+                                      f"codex mcp remove {PROJECT} 再卸载") from exc
+            return {"result": "removed"}
+        if not current.get("references_install"):
+            # 与本安装无关的同名条目（conflict）才保留；其它未知状态一律拒绝。
+            if state == "conflict":
+                helper.remove_marker()
+                return {"result": "foreign_preserved", "detail": current.get("detail")}
+            raise ManagementError(
+                "无法确认统一接口条目状态，已停止卸载。请先运行 "
+                + INTERFACE_GUIDANCE + " 后重试")
+        # 内容被改过但指向本安装：不删除（可能带着你自己的修改），一律拒绝卸载。
+        if current.get("enabled"):
+            reason = "已启用"
+        else:
+            reason = "当前禁用，但指向本安装的引用会在卸载后失效"
+        raise ManagementError(
+            f"统一接口条目 {PROJECT} 指向本安装，但内容与本工具记录的注册不同（{reason}）；"
+            f"已停止卸载并保留该条目。请先运行 {INTERFACE_GUIDANCE}；"
+            f"若该条目由你修改过，请手工运行 codex mcp remove {PROJECT} 确认删除后再卸载")
+
+    def interface_enable(self):
+        with self.locked():
+            try:
+                result = self.interface().enable()
+            except INTERFACE_ERRORS as exc:
+                raise ManagementError(f"启用统一接口失败：{exc}") from exc
+            if result.get("result") in {"enabled", "already_enabled"}:
+                try:
+                    self.remember_interface_enabled()
+                except (OSError, ManagementError) as exc:
+                    raise ManagementError(
+                        "统一接口已启用，但安装记录中的启用历史未能保存；"
+                        "后续无法确认注册是否清理。请检查技能目录后重试：" + str(exc)) from exc
+            return result
+
+    def interface_disable(self):
+        with self.locked():
+            try:
+                return self.interface().disable()
+            except INTERFACE_ERRORS as exc:
+                raise ManagementError(f"停用统一接口失败：{exc}") from exc
+
+    def interface_status(self):
+        return self.interface().status()
 
     def config(self):
         if load_receipt(self.skill) is None:
@@ -358,15 +554,21 @@ class Installation:
         old = load_receipt(self.skill)
         previous_activation = old.get("activation") if old else None
         requested_mode = (previous_activation or {"mode": "auto"})["mode"]
+        # 恢复已卸载的备份（回滚）时，启用历史也随备份的安装记录恢复。
+        restored_history = False
         if old is None and (source / RECEIPT).is_file():
             restored_receipt = load_receipt(source)
             requested_mode = (restored_receipt.get("activation") or {"mode": "auto"})["mode"]
+            restored_history = restored_receipt.get("interface_ever_enabled") is True
         template_path = source / "references/default-delegation.md"
         template = template_path.read_text(encoding="utf-8")
         activation_state, rule_edits = activation.plan(
             self.home, self.skill, previous_activation,
             requested_mode, template)
         self.check_launcher()
+        if old:
+            # 目标版本不含统一接口时，已注册的条目会指向被替换掉的服务器路径。
+            self.guard_interface_target(files)
         if old:
             changes = self.changed_files(old)
             if changes:
@@ -409,6 +611,9 @@ class Installation:
             receipt = {"schema_version": 1, "project": PROJECT, "repository": REPOSITORY,
                        "version": version, "revision": revision, "files": files,
                        "command_dir": str(self.command_dir), "activation": activation_state}
+            # 启用历史跨更新/回滚保留；它不含模型设置，也不代表当前注册状态。
+            if (old and old.get("interface_ever_enabled") is True) or restored_history:
+                receipt["interface_ever_enabled"] = True
             with self.user_path_transaction(old) as path_owned:
                 if platform_support.WINDOWS:
                     receipt["path_entry_added"] = path_owned
@@ -500,6 +705,7 @@ class Installation:
                 "local_code_changes": self.changed_files(receipt), "config": config,
                 "compatibility": compatibility_for_config(config),
                 "activation": activation.status(self.home, receipt.get("activation")),
+                "interface": self.interface_summary(),
                 "main_session": "unchanged"}
 
     def project_init(self, path=None, profile=None, model=None, effort=None):
@@ -570,18 +776,38 @@ class Installation:
             _, rule_edits = activation.plan(self.home, self.skill, receipt.get("activation"), "on-demand",
                                             repair=True)
             self.check_launcher()
+            # 先清理自己的 MCP 条目，避免卸载后留下指向已删除脚本的注册。
+            released = self.release_interface()
             old_launchers = {path: path.read_bytes() if path.exists() else None for path in self.launchers()}
             backup = self.backup_path()
-            with self.user_path_transaction(receipt, remove=True), self.rules_transaction(rule_edits):
-                self.skill.rename(backup)
-                try:
-                    for launcher in self.launchers():
-                        if launcher.exists():
-                            launcher.unlink()
-                except BaseException:
-                    backup.rename(self.skill)
-                    self.restore_launchers(old_launchers)
-                    raise
+            moved = False
+            restored = False
+            try:
+                with self.user_path_transaction(receipt, remove=True), self.rules_transaction(rule_edits):
+                    self.skill.rename(backup)
+                    moved = True
+                    try:
+                        for launcher in self.launchers():
+                            if launcher.exists():
+                                launcher.unlink()
+                    except BaseException:
+                        backup.rename(self.skill)
+                        moved = False
+                        self.restore_launchers(old_launchers)
+                        restored = True
+                        raise
+            except BaseException as exc:
+                if released.get("result") == "removed":
+                    # 注册已删除且不会自动恢复；代码与命令入口仍按既有逻辑还原，
+                    # 因此这里只报告“部分完成”，不声称全部回退。
+                    if restored or (not moved and self.skill.is_dir()):
+                        outcome = "本工具的代码和命令入口保持原样或已恢复"
+                    else:
+                        outcome = "本工具的代码和命令入口未能确认恢复，请检查后再重试"
+                    raise ManagementError(
+                        "卸载未完成：统一接口条目已删除，且不会自动恢复；" + outcome
+                        + "。如需继续使用统一接口，请在重新安装后运行 dw interface enable") from exc
+                raise
             return {"result": "uninstalled", "backup": str(backup)}
 
 
@@ -684,11 +910,36 @@ def print_project_change(value):
     print("请重新启动或重新读取 Codex 任务以加载项目指令；当前工具不能确认活动会话已加载。")
 
 
+def print_interface(value):
+    labels = {"registered": "已启用", "disabled": "已禁用（条目仍在配置中）", "absent": "未注册",
+              "changed": "内容与原始注册不一致，未改动", "conflict": "同名条目属于其他配置，未改动",
+              "unavailable": "无法确认"}
+    print(f"统一接口条目：{value.get('name', PROJECT)}")
+    print(f"状态：{labels.get(value.get('state'), value.get('state_label') or value.get('state') or '未知')}")
+    if value.get("detail"):
+        print(f"说明：{value['detail']}")
+    print(f"服务器脚本：{value.get('server')}（{'存在' if value.get('server_present') else '不存在'}）")
+    if value.get("marker_path"):
+        print(f"所有权标记：{value['marker_path']}（{'存在' if value.get('marker_present') else '不存在'}）")
+    entry = value.get("entry")
+    if isinstance(entry, dict):
+        print(f"条目内容：{entry.get('transport_type')} / {entry.get('command')}"
+              + (f" / {' '.join(entry['args'])}" if entry.get("args") else ""))
+    expected = value.get("expected")
+    if isinstance(expected, dict):
+        print(f"本安装期望：{expected.get('command')} / {' '.join(expected.get('args', []))}")
+    if value.get("restart_required"):
+        print("请重新启动 Codex 会话以加载统一接口；当前会话不会自动启用它。")
+    print("主代理模型和思考强度：沿用当前 Codex 会话设置；本操作未改动 workers.json。")
+
+
 def print_result(value, *, human=False):
     if not human:
         print(json.dumps(value, indent=2, ensure_ascii=False))
         return
-    if value.get("project") == "status":
+    if value.get("project") == "interface":
+        print_interface(value["interface"])
+    elif value.get("project") == "status":
         print_project_status(value)
     elif value.get("project") in {"init", "sync", "disable"}:
         print_project_change(value)
@@ -704,6 +955,13 @@ def print_result(value, *, human=False):
         print(f"代码检查：{'存在本地修改：' + ', '.join(changes) if changes else '正常'}")
         print_config(value["config"])
         print_compatibility(value.get("compatibility", {}))
+        interface = value.get("interface")
+        if isinstance(interface, dict):
+            print("\n统一接口（本机摘要）：")
+            print(f"  服务器脚本：{interface.get('server')}"
+                  f"（{'存在' if interface.get('server_present') else '不存在'}）")
+            print(f"  所有权标记：{'存在' if interface.get('marker_present') else '不存在'}")
+            print(f"  核对方式：{interface.get('detail', '')}")
         print("\n主代理模型和思考强度：沿用当前 Codex 会话设置")
     elif "activation" in value:
         print_activation(value["activation"])
@@ -757,7 +1015,8 @@ def menu(installation, source=None, stream=None):
             print_activation(activation.status(installation.home, receipt.get("activation")))
         print("\n执行子代理管理\n"
               "1. 安装 / 更新\n2. 设置执行模型和思考强度\n3. 查看状态和当前设置\n"
-              "4. 开启 / 关闭默认委派\n5. 回滚版本（保留执行设置）\n6. 卸载\n0. 退出")
+              "4. 开启 / 关闭默认委派\n5. 回滚版本（保留执行设置）\n6. 卸载\n"
+              "7. 统一接口（启用 / 停用 / 查看注册状态）\n0. 退出")
         try:
             choice = prompt(stream, "请选择", "0")
             if choice == "0":
@@ -797,8 +1056,21 @@ def menu(installation, source=None, stream=None):
                 if answer not in {"1", "2"}:
                     raise ManagementError("请输入 1 或 2")
                 print_result(installation.set_mode("auto" if answer == "1" else "on-demand"), human=True)
+            elif choice == "7":
+                if receipt is None:
+                    raise ManagementError("请先选择菜单 1 安装本技能")
+                status = installation.interface_status()
+                print_result(status, human=True)
+                answer = prompt(stream, "统一接口：1 启用，2 停用，3 仅查看状态", "3")
+                if answer == "1":
+                    print_result(installation.interface_enable(), human=True)
+                elif answer == "2":
+                    if prompt(stream, "输入“停用”确认移除本工具注册的统一接口条目") in {"停用", "disable"}:
+                        print_result(installation.interface_disable(), human=True)
+                elif answer != "3":
+                    raise ManagementError("请输入 1、2 或 3")
             else:
-                print("请输入 0 到 6 的菜单编号。")
+                print("请输入 0 到 7 的菜单编号。")
         except EOFError:
             return
         except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
@@ -824,6 +1096,11 @@ def main(argv=None):
     mode.add_argument("value", choices=["auto", "on-demand"])
     uninstall = commands.add_parser("uninstall")
     uninstall.add_argument("--yes", action="store_true")
+    interface = commands.add_parser("interface", help="管理统一 worker 接口的 MCP 注册")
+    interface_commands = interface.add_subparsers(dest="interface_command", required=True)
+    interface_commands.add_parser("enable", help="在 Codex 配置中注册本工具的统一接口条目")
+    interface_commands.add_parser("disable", help="移除本工具注册的统一接口条目")
+    interface_commands.add_parser("status", help="只读查看统一接口注册状态")
     project = commands.add_parser("project", help="管理当前项目的委派规则")
     project_commands = project.add_subparsers(dest="project_command", required=True)
     project_init = project_commands.add_parser("init", help="启用或重新配置项目委派")
@@ -864,12 +1141,21 @@ def main(argv=None):
             if not args.yes:
                 raise ManagementError("请使用 uninstall --yes，或在菜单中选择“卸载”")
             output = installation.uninstall()
+        elif args.command == "interface":
+            if args.interface_command == "enable" and load_receipt(installation.skill) is None:
+                raise ManagementError("请先选择菜单 1 安装本技能")
+            output = {"enable": installation.interface_enable,
+                      "disable": installation.interface_disable,
+                      "status": installation.interface_status}[args.interface_command]()
         else:
             output = installation.status()
         print_result(output, human=sys.stdout.isatty())
         if args.command in {"install", "update", "rollback"}:
             installation.print_commands()
             print("请重新启动 Codex 会话以加载技能及默认委派规则。")
+        elif args.command == "interface" and args.interface_command in {"enable", "disable"}:
+            print("请重新启动 Codex 会话，使统一接口注册的改动生效；"
+                  "当前会话仍按启动时的配置运行。")
         return 0
     except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
         print(f"操作失败：{exc}", file=sys.stderr)
