@@ -382,7 +382,7 @@ class Server:
         cwd = _absolute_directory(arguments["cwd"], "cwd")
         profile = _optional_string(arguments, "profile", "profile")
         model = _optional_string(arguments, "model", "model")
-        effort = _optional_string(arguments, "reasoning_effort", "reasoning_effort")
+        effort = _optional_choice(arguments, "reasoning_effort", EFFORT_VALUES, "reasoning_effort")
         if model is not None and effort is None:
             raise ProtocolError(INVALID_PARAMS,
                                 "显式指定 model 时必须同时显式指定 reasoning_effort")

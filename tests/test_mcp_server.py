@@ -283,6 +283,16 @@ class MalformedInputTests(ServerCase):
                 reply = client.call("tools/list", params)
                 self.assertEqual(reply["error"]["code"], -32602)
 
+    def test_invalid_effort_rejected_before_backend_lookup(self):
+        # A backend with no dispatch method must never be touched by invalid input.
+        server = mcp_server.Server(object())
+        server.initialized = True
+        reply = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                               "params": {"name": "spawn_agent", "arguments": {
+                                   "task": "x", "cwd": str(self.project),
+                                   "reasoning_effort": "extreme"}}})
+        self.assertEqual(reply["error"]["code"], -32602, reply)
+
     def test_tools_call_argument_validation(self):
         client = self.client()
         client.initialize()

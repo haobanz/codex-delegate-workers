@@ -582,10 +582,10 @@ class EnableTests(InterfaceTestCase):
     def test_command_only_edit_is_never_echoed_in_status(self):
         """被改过的命令可能带凭据，状态里不得出现原文本。"""
         self.interface.enable()
-        self._rewrite_entry(command="runner --token " + self.secret)
+        self._rewrite_entry(command="SYNTHETIC_FOREIGN_COMMAND --token " + self.secret)
         rendered = json.dumps(self.interface.status(), ensure_ascii=False)
         self.assertNotIn(self.secret, rendered)
-        self.assertNotIn("runner", rendered)
+        self.assertNotIn("SYNTHETIC_FOREIGN_COMMAND", rendered)
 
     def test_foreign_entry_arguments_are_not_echoed_in_status(self):
         """同名他人条目的参数可能带凭据，状态里不得出现原文本。"""
