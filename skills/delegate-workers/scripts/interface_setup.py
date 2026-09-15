@@ -17,9 +17,11 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
+import stat
 import shutil
 import subprocess
 import sys
@@ -70,10 +72,62 @@ def _timestamp():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _regular_target(path):
+    """返回目标文件的 stat；不存在为 None，非普通文件（含符号链接）直接拒绝。"""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise OSError(errno.EINVAL, "标记目标不是普通文件", str(path))
+    return info
+
+
+def _write_across_devices(path, data, mode):
+    """跨盘直接写最终标记；可恢复普通写入失败，但不承诺掉电原子性。"""
+    previous = _regular_target(path)
+    flags = os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    if previous is None:
+        flags |= os.O_CREAT | os.O_EXCL
+    descriptor = os.open(path, flags, mode)
+    with os.fdopen(descriptor, "r+b") as stream:
+        opened = os.fstat(stream.fileno())
+        if not stat.S_ISREG(opened.st_mode) or (previous is not None and
+                (opened.st_dev, opened.st_ino) != (previous.st_dev, previous.st_ino)):
+            raise OSError(errno.EAGAIN, "标记目标已变化，停止写入", str(path))
+        before = stream.read() if previous is not None else None
+        try:
+            stream.seek(0)
+            stream.write(data)
+            stream.truncate()
+            stream.flush()
+            os.fsync(stream.fileno())
+        except OSError as write_error:
+            try:
+                if before is not None:
+                    stream.seek(0)
+                    stream.write(before)
+                    stream.truncate()
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                else:
+                    stream.close()
+                    current = _regular_target(path)
+                    if current is not None:
+                        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
+                            raise OSError(errno.EAGAIN, "清理前目标已变化", str(path))
+                        path.unlink()
+            except OSError as recovery_error:
+                raise OSError(f"跨盘标记写入失败：{write_error}；恢复也失败：{recovery_error}") from write_error
+            raise
+
+
 def atomic_write(path, data, mode=0o600):
-    """在项目 tmp 暂存并原子替换；跨文件系统失败时保留原目标。"""
+    """项目 tmp 暂存；同盘原子替换，跨盘直接写入并恢复普通失败。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    previous = _regular_target(path)
+    final_mode = stat.S_IMODE(previous.st_mode) if previous is not None else mode
     with tempfile.TemporaryDirectory(prefix="delegate-workers-interface-write-",
                                      dir=platform_support.project_tmp()) as scratch:
         descriptor, temporary = tempfile.mkstemp(prefix="marker-", dir=scratch)
@@ -81,8 +135,14 @@ def atomic_write(path, data, mode=0o600):
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.chmod(temporary, mode)
-        os.replace(temporary, path)
+        os.chmod(temporary, final_mode)
+        _regular_target(path)
+        try:
+            os.replace(temporary, path)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
+                raise
+            _write_across_devices(path, data, final_mode)
 
 
 def json_bytes(value):

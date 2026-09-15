@@ -4,6 +4,8 @@
 不读写真实用户配置，也没有任何网络或模型调用。
 """
 
+import contextlib
+import errno
 import importlib.util
 import json
 import os
@@ -399,11 +401,106 @@ class AtomicWriteTests(InterfaceTestCase):
         destination = self.home / "marker-test.json"
         destination.write_bytes(b"original marker")
         with patch.object(interface_setup.platform_support, "project_tmp", return_value=scratch), \
-                patch.object(interface_setup.os, "replace", side_effect=OSError(18, "cross-device replace")):
-            with self.assertRaises(OSError):
+                patch.object(interface_setup.os, "replace",
+                             side_effect=PermissionError(errno.EACCES, "permission denied")):
+            with self.assertRaises(PermissionError):
                 interface_setup.atomic_write(destination, b"replacement marker")
         self.assertEqual(destination.read_bytes(), b"original marker")
         self.assertEqual(list(scratch.iterdir()), [])
+
+    # ------------------------------------------------------------ 跨盘（EXDEV）
+
+    def scratch_and_destination(self):
+        scratch = self.root / "atomic-scratch"
+        scratch.mkdir()
+        return scratch, self.home / "cross-drive-marker.json"
+
+    @contextlib.contextmanager
+    def cross_device_replace(self, scratch, destination, error=None):
+        """暂存仍写在项目 tmp；仅对最终目标注入跨盘 replace 失败。"""
+        real_replace = interface_setup.os.replace
+
+        def replace(source, target):
+            self.assertTrue(Path(source).is_relative_to(scratch))
+            self.assertEqual(Path(target), destination)
+            raise error if error is not None else OSError(errno.EXDEV, "cross-device link")
+
+        with patch.object(interface_setup.platform_support, "project_tmp", return_value=scratch), \
+                patch.object(interface_setup.os, "replace", side_effect=replace):
+            yield
+
+    @contextlib.contextmanager
+    def failing_target_fsync(self, index=2):
+        """staging 也调用 fsync：只让第 index 次（目标文件）失败。"""
+        real_fsync = interface_setup.os.fsync
+        calls = []
+
+        def fsync(descriptor):
+            calls.append(descriptor)
+            if len(calls) == index:
+                raise OSError(errno.EIO, "simulated fsync failure")
+            return real_fsync(descriptor)
+
+        with patch.object(interface_setup.os, "fsync", side_effect=fsync):
+            yield calls
+
+    def test_cross_device_replace_creates_new_marker(self):
+        scratch, destination = self.scratch_and_destination()
+        with self.cross_device_replace(scratch, destination):
+            interface_setup.atomic_write(destination, b"new marker")
+        self.assertEqual(destination.read_bytes(), b"new marker")
+        self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_cross_device_replace_overwrites_existing_marker(self):
+        scratch, destination = self.scratch_and_destination()
+        destination.write_bytes(b"original marker")
+        with self.cross_device_replace(scratch, destination):
+            interface_setup.atomic_write(destination, b"replacement marker")
+        self.assertEqual(destination.read_bytes(), b"replacement marker")
+        self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_winerror_17_is_treated_as_cross_device(self):
+        scratch, destination = self.scratch_and_destination()
+        destination.write_bytes(b"original marker")
+        windows_error = OSError(errno.EINVAL, "Windows cross-device replace")
+        windows_error.winerror = 17
+        with self.cross_device_replace(scratch, destination, error=windows_error):
+            interface_setup.atomic_write(destination, b"windows marker")
+        self.assertEqual(destination.read_bytes(), b"windows marker")
+        self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_cross_device_fsync_failure_restores_previous_marker(self):
+        scratch, destination = self.scratch_and_destination()
+        destination.write_bytes(b"original marker")
+        with self.cross_device_replace(scratch, destination), self.failing_target_fsync() as calls:
+            with self.assertRaises(OSError) as caught:
+                interface_setup.atomic_write(destination, b"replacement marker")
+        self.assertNotEqual(getattr(caught.exception, "winerror", None), 17)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(destination.read_bytes(), b"original marker")
+        self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_cross_device_fsync_failure_removes_new_marker(self):
+        scratch, destination = self.scratch_and_destination()
+        with self.cross_device_replace(scratch, destination), self.failing_target_fsync() as calls:
+            with self.assertRaises(OSError):
+                interface_setup.atomic_write(destination, b"new marker")
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(scratch.iterdir()), [])
+
+    def test_symlink_target_is_rejected_and_preserved(self):
+        target = self.home / "real-marker.json"
+        target.write_bytes(b"original marker")
+        destination = self.home / "marker-link.json"
+        try:
+            destination.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("当前平台无法创建符号链接")
+        with self.assertRaises(OSError):
+            interface_setup.atomic_write(destination, b"replacement marker")
+        self.assertTrue(destination.is_symlink())
+        self.assertEqual(target.read_bytes(), b"original marker")
 
 
 class EnableTests(InterfaceTestCase):
@@ -717,6 +814,31 @@ class EnableTests(InterfaceTestCase):
         self.interface.status()
         self.interface.enable()
         self.assertEqual(self.marker_path().read_bytes(), marker_bytes)
+
+    def test_enable_repeat_and_disable_across_devices(self):
+        """真实 os.replace 仅对标记目标注入 EXDEV，生命周期与普通路径一致。"""
+        marker = self.marker_path()
+        real_replace = interface_setup.os.replace
+
+        def replace(source, target):
+            if Path(target) == marker:
+                raise OSError(errno.EXDEV, "simulated cross-device marker write")
+            return real_replace(source, target)
+
+        with patch.object(interface_setup.os, "replace", side_effect=replace):
+            first = self.interface.enable()
+            self.assertEqual(first["result"], "enabled")
+            value = json.loads(marker.read_text(encoding="utf-8"))
+            self.assertEqual(value["project"], "delegate-workers")
+            self.assertEqual(self.interface.enable()["result"], "already_enabled")
+            status = self.interface.status()["interface"]
+            self.assertEqual(status["state"], "registered")
+            self.assertTrue(status["owned"])
+            self.assert_environment_preserved()
+            self.assertEqual(self.interface.disable()["result"], "disabled")
+        self.assertFalse(marker.exists())
+        self.assert_not_registered()
+        self.assert_environment_preserved()
 
     def test_reenabling_disabled_entry_keeps_previous_python_command(self):
         """重新启用被禁用的旧解释器条目时，不静默换成当前解释器。"""
