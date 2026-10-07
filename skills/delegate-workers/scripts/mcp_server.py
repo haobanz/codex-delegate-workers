@@ -166,12 +166,16 @@ def tool_definitions():
             "name": "spawn_agent",
             "title": "启动一个执行 worker",
             "description": "立即返回并启动一个独立的本地 codex exec 进程（全新进程，不复用旧会话），显式传入模型与思考强度，"
-                           "沿用当前 CODEX_HOME 的供应商和认证。任务较长时请稍后用 get_agent 轮询；"
+                           "沿用当前 CODEX_HOME 的供应商和认证。主代理先整理已知信息和共享接口，准备边界明确、"
+                           "可独立验证的小节任务书；缺少信息时可先派只读采集任务，汇总后再派执行小节。"
+                           "worker 按任务书执行并自测，主代理负责审查和最终验收。任务较长时请稍后用 get_agent 轮询；"
                            "返回的 agent_id 是本适配器生成的 ID，不是 CLI 会话 ID。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "task": {"type": "string", "description": "交给 worker 的完整任务说明（必填）。"},
+                    "task": {"type": "string", "description": "主代理准备的完整任务说明（必填），可直接写小节任务书："
+                             "角色（只读采集或执行）、目标和完成条件、已核实信息、文件或函数边界、步骤、依赖与并发边界、"
+                             "验证命令及预期、回报要求；发现矛盾或需越界时带证据上报。已有明确的小任务可用普通文本。"},
                     "cwd": {"type": "string",
 "description": "worker 的工作目录，必须是已存在的绝对路径（必填）；相对路径会被拒绝。"},
                     "profile": {"type": "string",

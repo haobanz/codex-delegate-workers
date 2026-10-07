@@ -19,6 +19,20 @@
 
 预设是偏好而非模型白名单。`validate_config` 只做结构校验和 v1 → v2 迁移，不修改传入参数，也不做能力判断。旧版的并发、尝试次数和固定 fallback 字段不会继续生效；保存或更新时会保留可恢复备份。
 
+## 分节任务书与执行范围
+
+主代理先列出信息缺口，必要时给只读采集 worker 明确问题和读取范围，要求返回事实、出处、覆盖情况与未知项；已有足够可靠的信息时不重复采集。主代理汇总核实后决定方案及共享契约，说明本任务相关的字段、类型、单位、默认值和错误语义，不让执行者重新猜整体设计。
+
+较大任务默认拆成单一目标、可独立验证的小节，每节交接角色、完成条件、已核实信息及来源、具体文件/函数和读写范围、修改步骤及保留行为、依赖与并发、验证命令和预期、回报及异常处理。已经明确的小任务不强行再拆。任务书可直接写在派发消息或 MCP 的 `task` 字符串里，原有单纯文本 API 保持可用，不要求任务文件、固定 JSON 字段或额外配置；可复制示例见[任务书参考](../skills/delegate-workers/references/task-brief.md)。
+
+并行要求没有待交付依赖且写入范围不重叠。模块存在调用关系，但契约已确定且双方不等待对方实现时也可并行；不同文件不等于契约独立，契约发生变化要重评受影响小节。有前置交付的小节等待主代理审查后再下发，不设固定并发数。
+
+worker 只做本小节必要的定位、实现和自测，不重做全局规划、不额外调查重构或加功能，不自行递归派发；主代理明确授权该小节再分工时除外。保留必要判断并允许反驳：对事实冲突、不合理方案、缺失信息、接口冲突或越界需求，带证据、影响和最小建议上报，暂停受影响部分，只继续已明确不受影响的授权独立小节，不自行扩范围或改共享契约。
+
+主代理查看实际 diff、相关测试、任务边界与共享契约，并检查相关整体调用/配置链或适用集成路径，再接受或退回位置和预期都明确的修正小节。验证命令及预期按真实工具确认，未核实的标为待确认；派发、自测和验收分别报告。流程属于指导和提示约束，不提供每文件硬 ACL 或自动调度，不改变模型和思考强度。
+
+源码修改须通过既有安装/更新流程传播到已安装 Skill；已初始化且启用的项目再显式执行 `dw project sync` 同步规则，随后启动新会话。普通任务不会自行更新安装、全局设置或项目规则。
+
 ## 项目级规则与全局模式
 
 `workers.json`、`dw configure`、全局 `dw status`、`dw mode` 和 `dw uninstall` 管理的是本工具的全局安装与执行预设。全局模式的默认规则段不会自动注册项目，也不会因为当前任务位于某个仓库就修改项目文件。
@@ -69,7 +83,7 @@ dw project init --path /path/to/other-project --profile complex
 
 `init` 立即在选定项目根创建或合并正确的 `AGENTS.md`，保留现有内容并维护带标记的规则段；它不会创建错误拼写的 `agent.md`。如果项目根存在非空 `AGENTS.override.md`，该文件优先作为活动目标，工具会针对这个活动文件处理规则。所有权元数据写入项目根 `.delegate-workers-project.json`；用户编辑受管理段时，写入会停止而不会覆盖编辑，禁用保留可逆备份。
 
-`.delegate-workers-project.json` 保存项目执行快照和受管理文件的所有权；分享或复制项目生命周期时，应与 `AGENTS.md`（或活动的 `AGENTS.override.md`）一起保留。`.delegate-workers-project.lock` 是项目根的稳定持久锁，操作期间不会删除；`.delegate-workers-project-backups/<timestamp-id>/manifest.json` 与其中的 preimage 文件保存变更前内容，供禁用和恢复使用。锁与备份通常不应提交到 Git；请按仓库策略自行忽略它们，本工具不会自动修改 `.gitignore`。
+`.delegate-workers-project.json` 保存项目执行快照和受管理文件的所有权；AI 编辑后还保存可选内部字段 `custom_rule`，记录带模型/强度占位符的受管理规则体。它沿用现有状态文件，不增加用户配置文件或设置开关。分享或复制项目生命周期时，应与 `AGENTS.md`（或活动的 `AGENTS.override.md`）一起保留。`.delegate-workers-project.lock` 是项目根的稳定持久锁，操作期间不会删除；`.delegate-workers-project-backups/<timestamp-id>/manifest.json` 与其中的 preimage 文件保存变更前内容，供禁用和恢复使用。锁与备份通常不应提交到 Git；请按仓库策略自行忽略它们，本工具不会自动修改 `.gitignore`。
 
 ### `status`、`sync` 与 `disable`
 
@@ -79,9 +93,51 @@ dw project sync [--path PATH]
 dw project disable [--path PATH]
 ```
 
-非 Git 目录同样需要 `--path`；`sync` 使用已保存的项目执行快照，不会随全局配置变化而切换模型或强度。
+非 Git 目录同样需要 `--path`；`sync` 使用已保存的项目执行快照，不会随全局配置变化而切换模型或强度。存在 `custom_rule` 时，它以已审查的 AI 规则体重新渲染，不冲回发行模板；重复 `init` 修改执行配置时重新绑定模型/强度，其余 AI 约定保留。`disable` 保留该快照，之后重新 `init` 可恢复受管理规则；受管理块外的项目约定保持在文档中。
 
 `sync` 只作用于已经注册且启用的项目，且是用户显式调用的后续更新；没有后台持续重建、全局扫描或隐式选择加入。`status` 是只读诊断，可以指出从项目根到请求目录的嵌套规则存在潜在覆盖，但不证明规则的语义效果。`disable` 只停用一个项目规则，不能和全局 `dw mode on-demand` 或 `dw uninstall` 混用：后两者分别管理全局委派段和整个工具安装，不会代替项目生命周期操作。
+
+### AI 编辑完整项目约定
+
+项目规则可以反复修改，内容包括项目背景、命令、读写范围、保留行为、分节任务书和验收方式。编辑采用“生成整份候选 → 审查全文及差异 → 备份并替换”的流程，适用于受管理段内外的约定。模型和思考强度仍由项目配置入口维护；AI 不通过改正文切换 worker。
+
+先在项目根运行 `dw project init`；未初始化或已停用的项目须先初始化/重新启用，再进入编辑。中文菜单支持：
+
+```bash
+dw project                  # 当前项目菜单；全局 dw 菜单第 8 项也可进入
+dw project menu --path .     # 显式指定项目，非 Git 目录也可用
+```
+
+命令行生成候选：
+
+```bash
+dw project edit --path . --request "补充项目背景、构建命令和验收方式，保留其他已有规则"
+```
+
+`edit` 使用本机已有的 Codex CLI，显式传入项目快照中的执行模型和思考强度，以只读 worker 返回完整 Markdown。供应商与认证沿用当前 Codex 安装，主代理设置保持不变。交互终端显示完整 diff 并询问应用；拒绝后保留草稿。缺少 `--request` 时交互询问修改要求，非交互运行则报错。生成失败或取消不会应用文档，也不会自行换模型。
+
+非交互 `edit` 只生成草稿，返回 `draft_dir`、`candidate`、`prompt` 和 `manifest` 等路径；不会因为 worker 成功结束就写入活动规则。之后可审查并应用：
+
+```bash
+dw project apply --draft "返回的 draft_dir"
+```
+
+`apply` 重新预览完整差异，交互确认后应用；非交互未加 `--yes` 时只预览。`edit` 与 `apply` 均支持 `--yes`，它表示本轮应用已经获得批准，并跳过交互询问；不是持久开关。
+
+主代理也可使用原生子代理完成起草，无需启用 MCP 或启动独立 CLI worker：
+
+1. 运行 `dw project prepare --path .`。该命令只捕获基线并建立草稿，不发起模型请求、不改活动规则或项目状态。
+2. 读取返回的 `prompt.txt` 和完整候选初稿，按已核实信息给 worker 明确任务书：修改目标、要保留的规则、完整 Markdown 输出、唯一可写的绝对 `candidate` 路径以及验收点。worker 只修改候选，不写活动 `AGENTS.md` 或状态文件，不自行再委派。
+3. 主代理读取候选全文，并调用 `project_edit.preview_edit(draft_dir)` 取得完整 diff 和 `candidate_sha256`。检查新增、删除和保留约定是否符合要求，不能把结构检查当成语义验收。
+4. 主代理调用 `project_edit.apply_edit(draft_dir, candidate_sha256=已审查的摘要)`；传入刚刚审查的摘要，不能重新计算摘要来绕过候选变化。CLI `apply` 在自己的预览及确认过程中绑定同样的候选摘要。
+
+这两个 API 位于已安装 Skill 的 `scripts/project_edit.py`；`prepare_edit(path, request=...)` 是准备接口，`generate_edit(prepared, codex_home)` 是已有本地 CLI 生成接口。使用真实安装路径读取模块，不要求另建 MCP 工具。原生派发仍须使用宿主实际 schema 和项目指定模型/强度；文件写入边界由任务书明确，不据此承诺宿主提供每文件 ACL。
+
+候选必须是非空、有界的 UTF-8 完整 Markdown，保留唯一合法的 `delegate-workers:project` 标记和与项目快照一致的模型/强度声明。脚本拒绝标记破损或从正文改模型；是否保留无关项目规则由主代理或用户审查。普通 `init`、`sync` 和 `disable` 对手改受管理块的保护保持有效；明确 `prepare` / `edit` 可读取合法但校验值已变化的块，在本轮审查与 `apply` 后重新纳管。
+
+应用前在项目锁内核对两种指令文件、状态文件和已审查候选的基线。起草期间出现文件修改、新的 override 或状态变化时拒绝覆盖，保留草稿供重新准备。完整活动文档和状态一起备份、写入及失败回滚，保留行尾和文件模式；不先删除旧文件。所有草稿、日志和事务暂存位于准确项目根的 `tmp/`，不提交到 Git。
+
+保存后的 `custom_rule` 和规则摘要由工具维护；`sync`、修改 worker、停用后重新启用均保留 AI 规则。更新发行模板不会自动改写该快照，可通过下一轮编辑纳入需要的新约定。应用成功只表示文件已更新；须重新启动 Codex 会话加载新规则，不证明实际 worker 身份或主会话的业务工具连接可供独立 CLI 使用。
 
 ### 状态与运行时边界
 
@@ -136,16 +192,16 @@ dw interface disable  # 只移除本工具拥有的注册
 - `writable_files` 是传给执行者的文件范围说明，不是每文件级别的强制 ACL；它用于沟通边界，执行仍受所选的沙箱模式约束。
 - `list_models` 只报告调用者已配置的偏好，不是供应商完整模型目录，也不代表账户可用性。
 
-最小 `spawn_agent` 调用示例（模型与强度只是示例，不代表所有用户或所有任务的默认值；`cwd` 请替换为真实的绝对路径）：
+`spawn_agent` 任务书示例（模型、强度、文件及命令都是示例，主代理需先核实本项目事实、现有测试覆盖和工具；`cwd` 请替换为真实的绝对路径）：
 
 ```json
 {
-  "task": "实现这个功能，并运行相关测试；只改授权范围内的文件。",
+  "task": "角色：执行。小节：补查未知模型显式覆盖的回归断言。只读取 skills/delegate-workers/scripts/workers.py 的 resolve()/validate_worker() 和 tests/test_workers.py，只修改 tests/test_workers.py 的 WorkerTests 相关用例。方案：未知模型 ID 保持原样、compatibility.status 为 unverified、runtime_verified 为 false、输入配置不变；核对已有用例，只补缺少的断言，已有覆盖则报告位置。依赖：主代理已核实上述契约并验收采集结果；本轮无人并行写该测试文件，可与 README 文档小节并行。验证：python3 -m unittest discover -s tests -p test_workers.py，预期相关用例通过；命令未获主代理实际环境确认时标待确认。回报改动位置、覆盖情况、命令与结果、异议和未验证项。若实现与契约冲突，带证据及最小建议上报并暂停受影响部分，不自行改生产代码或配置，不重新规划或再委派。",
   "cwd": "/absolute/path/to/your/project",
   "model": "deepseek/deepseek-v4.1-flash",
   "reasoning_effort": "max",
   "sandbox": "workspace-write",
-  "writable_files": ["src/module.py", "tests/test_module.py"]
+  "writable_files": ["tests/test_workers.py"]
 }
 ```
 

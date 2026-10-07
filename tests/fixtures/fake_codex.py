@@ -18,6 +18,7 @@
     FAKE_CODEX_DETACHED_CHILD=1  # 附带一个独立会话（setsid）的子进程：不能只靠进程组收尾
     FAKE_CODEX_INHERIT_STDERR_CHILD=1  # 组长立即退出，但附带子进程继续持有 stderr 管道
     FAKE_CODEX_OUTPUT_BYTES=字节数  # 最终输出写满指定字节数（用于验证有界读取与截断标记）
+    FAKE_CODEX_FINAL_FILE=路径   # 最终输出读取预先准备的完整文件（编辑候选场景）
 """
 
 import argparse
@@ -155,6 +156,9 @@ def main(argv=None):
         filler = int(os.environ.get("FAKE_CODEX_OUTPUT_BYTES", "0") or 0)
         if filler:
             Path(args.output_last_message).write_bytes(b"x" * filler)
+        elif os.environ.get("FAKE_CODEX_FINAL_FILE"):
+            Path(args.output_last_message).write_bytes(
+                Path(os.environ["FAKE_CODEX_FINAL_FILE"]).read_bytes())
         else:
             Path(args.output_last_message).write_text(
                 "FAKE 最终回答：任务已完成。\n"

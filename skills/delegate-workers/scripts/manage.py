@@ -40,8 +40,9 @@ CAPABILITY_RUNTIME_REQUIRED = {"scripts/capabilities.py", "model-capabilities.js
 PROJECT_RUNTIME_REQUIRED = {"scripts/project_rules.py", "references/project-delegation.md"}
 INTERFACE_RUNTIME_REQUIRED = {"scripts/cli_support.py", "scripts/worker_runtime.py",
                               "scripts/mcp_server.py", "scripts/interface_setup.py"}
+EDITOR_RUNTIME_REQUIRED = {"scripts/project_edit.py"}
 RUNTIME_REQUIRED = (BASE_RUNTIME_REQUIRED | CAPABILITY_RUNTIME_REQUIRED | PROJECT_RUNTIME_REQUIRED
-                    | INTERFACE_RUNTIME_REQUIRED)
+                    | INTERFACE_RUNTIME_REQUIRED | EDITOR_RUNTIME_REQUIRED)
 INTERFACE_GUIDANCE = "dw interface disable"
 INTERFACE_MARKER = "delegate-workers-interface.json"
 # helper.state() 可能返回的已知状态；其它取值一律视为“无法确认”。
@@ -63,7 +64,19 @@ def required_files_for_candidate(files):
         required |= PROJECT_RUNTIME_REQUIRED
     if set(files) & INTERFACE_RUNTIME_REQUIRED:
         required |= INTERFACE_RUNTIME_REQUIRED
+    if set(files) & EDITOR_RUNTIME_REQUIRED:
+        required |= (EDITOR_RUNTIME_REQUIRED | PROJECT_RUNTIME_REQUIRED
+                     | INTERFACE_RUNTIME_REQUIRED | CAPABILITY_RUNTIME_REQUIRED)
     return required
+
+
+def project_editor():
+    """Load the optional editor only when an editing command is requested."""
+    try:
+        import project_edit
+    except ImportError as exc:
+        raise ManagementError("当前安装缺少项目 AI 编辑模块或其依赖，请先运行 dw update") from exc
+    return project_edit
 
 
 def validate_worker_for_configuration(worker):
@@ -180,6 +193,22 @@ def validate_staged_candidate(stage, managed_files):
         if startup.returncode:
             detail = startup.stderr.strip() or startup.stdout.strip()
             raise ManagementError(failure + (f"：{detail}" if detail else ""))
+    if "scripts/project_edit.py" in set(managed_files):
+        # manage imports the editor lazily; explicitly check its real import and
+        # public contract before replacing a working installation.
+        script = ("import sys; sys.path.insert(0, sys.argv[1]); import project_edit; "
+                  "assert all(callable(getattr(project_edit, name, None)) for name in "
+                  "('prepare_edit', 'preview_edit', 'apply_edit', 'generate_edit'))")
+        try:
+            editor_check = subprocess.run(
+                [sys.executable, "-X", "utf8", "-c", script, str(stage / "scripts")],
+                capture_output=True, text=True, encoding="utf-8", check=False, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ManagementError("新版本项目编辑器无法导入，已停止更新") from exc
+        if editor_check.returncode:
+            detail = editor_check.stderr.strip() or editor_check.stdout.strip()
+            raise ManagementError("新版本项目编辑器无法导入，已停止更新"
+                                  + (f"：{detail}" if detail else ""))
 
 
 def load_receipt(directory):
@@ -759,6 +788,48 @@ class Installation:
     def project_disable(self, path=None):
         return project_rules.disable_project(path)
 
+    def project_prepare(self, path=None, request=""):
+        return project_editor().prepare_edit(path, request=request)
+
+    def project_edit(self, path=None, request=None, *, yes=False, stream=None):
+        interactive = stream is not None or (sys.stdin.isatty() and sys.stdout.isatty())
+        if request is None or not request.strip():
+            if not interactive:
+                raise ManagementError("非交互式修改必须指定 --request；先起草请使用 project prepare")
+            request = prompt(stream or sys.stdin, "希望怎样修改项目规则（描述要求）")
+            if not request:
+                raise ManagementError("修改要求不能为空")
+        editor = project_editor()
+        prepared = editor.prepare_edit(path, request=request)
+        if interactive:
+            worker = prepared["worker"]
+            print(f"正在生成完整候选：{worker['model']} / {worker['reasoning_effort']}")
+            print(f"草稿位置：{prepared['draft_dir']}")
+        generated = editor.generate_edit(prepared, self.home)
+        reviewed = self.project_apply(prepared["draft_dir"], yes=yes, stream=stream)
+        return {**generated, **reviewed}
+
+    def project_apply(self, draft, *, yes=False, stream=None):
+        editor = project_editor()
+        preview = editor.preview_edit(draft)
+        interactive = stream is not None or (sys.stdin.isatty() and sys.stdout.isatty())
+        if interactive:
+            print_project_edit(preview)
+        if not yes:
+            if not interactive:
+                return {**preview, "result": "draft"}
+            try:
+                answer = prompt(stream or sys.stdin, "审查以上差异后应用完整项目规则？是/否", "否")
+            except EOFError:
+                answer = "否"
+            if answer.lower() not in {"是", "y", "yes", "应用"}:
+                return {**preview, "result": "draft"}
+        result = editor.apply_edit(draft, candidate_sha256=preview["candidate_sha256"])
+        if not interactive:
+            result = {**result, "diff": preview["diff"],
+                      "candidate_sha256": preview["candidate_sha256"]}
+        return result
+
     def rollback(self):
         with self.locked():
             backups = sorted(self.backups.glob("*"), reverse=True)
@@ -910,6 +981,42 @@ def print_project_change(value):
     print("请重新启动或重新读取 Codex 任务以加载项目指令；当前工具不能确认活动会话已加载。")
 
 
+def print_project_edit(value):
+    labels = {"prepared": "项目规则草稿已准备", "generated": "项目规则候选已生成",
+              "draft": "候选已保留，项目规则未应用", "preview": "项目规则候选待审查",
+              "applied": "项目规则已替换", "unchanged": "项目规则无需变化"}
+    print(labels.get(value.get("result"), "项目规则候选待审查"))
+    print(f"项目根目录：{value.get('project_root')}")
+    for field, label in (("candidate", "完整候选"), ("prompt", "AI 任务书"),
+                         ("draft_dir", "草稿目录"), ("backup", "备份位置")):
+        if value.get(field):
+            print(f"{label}：{value[field]}")
+    if value.get("worker"):
+        worker = value["worker"]
+        print(f"项目执行模型：{worker['model']} / {worker['reasoning_effort']}")
+    if value.get("agent_id"):
+        print(f"生成代理 ID：{value['agent_id']}（独立 CLI worker）")
+        observed = value.get("observed")
+        if isinstance(observed, dict):
+            values = observed.get("values") or {}
+            effort = values.get("reasoning effort", values.get("reasoning_effort", "未提供"))
+            if values.get("model") or effort != "未提供":
+                print(f"启动记录：{values.get('model', '未提供')} / "
+                      f"{effort}")
+            if observed.get("status") == "unverified":
+                print("启动配置：未验证，元数据缺失或不完整。")
+        else:
+            print("启动配置：未验证，宿主没有提供元数据。")
+        print("模型身份：请求参数和启动记录不证明上游物理模型身份。")
+    if "diff" in value:
+        print("\n候选差异：")
+        print(value["diff"] or "候选与现有规则无差异。")
+    if value.get("result") in {"applied", "unchanged"}:
+        print("请重新启动或重新读取 Codex 任务以加载项目指令；当前工具不能确认活动会话已加载。")
+    else:
+        print("先审查候选，再用 dw project apply --draft 草稿目录 应用；当前项目规则未改变。")
+
+
 def print_interface(value):
     labels = {"registered": "已启用", "disabled": "已禁用（条目仍在配置中）", "absent": "未注册",
               "changed": "内容与原始注册不一致，未改动", "conflict": "同名条目属于其他配置，未改动",
@@ -943,6 +1050,8 @@ def print_result(value, *, human=False):
         print_project_status(value)
     elif value.get("project") in {"init", "sync", "disable"}:
         print_project_change(value)
+    elif value.get("project") == "edit":
+        print_project_edit(value)
     elif "installed" in value:
         print(f"\n安装状态：{'已安装' if value['installed'] else '未安装'}")
         print(f"技能目录：{value['skill']}")
@@ -1000,6 +1109,54 @@ def prompt(stream, label, default=None):
     return line.strip() or default or ""
 
 
+def project_menu(installation, path=None, stream=None):
+    if stream is None:
+        try:
+            with open("CONIN$" if platform_support.WINDOWS else "/dev/tty", "r", encoding="utf-8") as terminal:
+                return project_menu(installation, path, terminal)
+        except OSError as exc:
+            if sys.stdin.isatty():
+                return project_menu(installation, path, sys.stdin)
+            raise ManagementError("项目菜单需要交互式终端；脚本中请使用 project init、edit、apply 或 status") from exc
+    while True:
+        print(f"\n项目配置：{Path(path or Path.cwd()).expanduser().absolute()}\n"
+              "1. 初始化 / 重新启用项目配置\n2. 修改项目执行模型和思考强度\n"
+              "3. 用 AI 修改完整项目规则\n4. 查看项目状态和当前配置\n"
+              "5. 同步项目规则\n6. 停用项目委派\n0. 返回")
+        try:
+            choice = prompt(stream, "请选择", "0")
+            if choice == "0":
+                return
+            if choice == "1":
+                print_result(installation.project_init(path), human=True)
+            elif choice == "2":
+                status = installation.project_status(path)
+                worker = status.get("worker")
+                if not worker:
+                    config = installation.config()
+                    worker = config["profiles"][config["default_profile"]]
+                model = prompt(stream, "项目执行模型 ID", worker["model"])
+                effort = select_effort(stream, worker["reasoning_effort"])
+                print_result(installation.project_init(path, model=model, effort=effort), human=True)
+            elif choice == "3":
+                result = installation.project_edit(path, stream=stream)
+                # project_apply already displayed the complete diff before asking.
+                print_result({key: value for key, value in result.items() if key != "diff"}, human=True)
+            elif choice == "4":
+                print_result(installation.project_status(path), human=True)
+            elif choice == "5":
+                print_result(installation.project_sync(path), human=True)
+            elif choice == "6":
+                if prompt(stream, "停用项目委派？是/否", "否").lower() in {"是", "y", "yes"}:
+                    print_result(installation.project_disable(path), human=True)
+            else:
+                print("请输入 0 到 6 的菜单编号。")
+        except EOFError:
+            return
+        except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+            print(f"操作失败：{exc}", file=sys.stderr)
+
+
 def menu(installation, source=None, stream=None):
     if stream is None:
         try:
@@ -1016,7 +1173,7 @@ def menu(installation, source=None, stream=None):
         print("\n执行子代理管理\n"
               "1. 安装 / 更新\n2. 设置执行模型和思考强度\n3. 查看状态和当前设置\n"
               "4. 开启 / 关闭默认委派\n5. 回滚版本（保留执行设置）\n6. 卸载\n"
-              "7. 统一接口（启用 / 停用 / 查看注册状态）\n0. 退出")
+              "7. 统一接口（启用 / 停用 / 查看注册状态）\n8. 项目配置与 AI 规则修改\n0. 退出")
         try:
             choice = prompt(stream, "请选择", "0")
             if choice == "0":
@@ -1069,8 +1226,11 @@ def menu(installation, source=None, stream=None):
                         print_result(installation.interface_disable(), human=True)
                 elif answer != "3":
                     raise ManagementError("请输入 1、2 或 3")
+            elif choice == "8":
+                path = Path(prompt(stream, "项目目录", str(Path.cwd())))
+                project_menu(installation, path, stream)
             else:
-                print("请输入 0 到 7 的菜单编号。")
+                print("请输入 0 到 8 的菜单编号。")
         except EOFError:
             return
         except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
@@ -1101,19 +1261,32 @@ def main(argv=None):
     interface_commands.add_parser("enable", help="在 Codex 配置中注册本工具的统一接口条目")
     interface_commands.add_parser("disable", help="移除本工具注册的统一接口条目")
     interface_commands.add_parser("status", help="只读查看统一接口注册状态")
-    project = commands.add_parser("project", help="管理当前项目的委派规则")
-    project_commands = project.add_subparsers(dest="project_command", required=True)
+    project = commands.add_parser("project", help="管理当前项目配置和完整项目规则")
+    project.add_argument("--path", type=Path)
+    project_commands = project.add_subparsers(dest="project_command")
+    project_menu_command = project_commands.add_parser("menu", help="打开中文项目配置菜单")
+    project_menu_command.add_argument("--path", type=Path, default=argparse.SUPPRESS)
     project_init = project_commands.add_parser("init", help="启用或重新配置项目委派")
-    project_init.add_argument("--path", type=Path)
+    project_init.add_argument("--path", type=Path, default=argparse.SUPPRESS)
     project_init.add_argument("--profile")
     project_init.add_argument("--model")
     project_init.add_argument("--effort")
     project_sync = project_commands.add_parser("sync", help="使用项目快照同步委派规则")
-    project_sync.add_argument("--path", type=Path)
+    project_sync.add_argument("--path", type=Path, default=argparse.SUPPRESS)
     project_status = project_commands.add_parser("status", help="查看项目委派状态（只读）")
-    project_status.add_argument("--path", type=Path)
+    project_status.add_argument("--path", type=Path, default=argparse.SUPPRESS)
     project_disable = project_commands.add_parser("disable", help="禁用项目委派规则")
-    project_disable.add_argument("--path", type=Path)
+    project_disable.add_argument("--path", type=Path, default=argparse.SUPPRESS)
+    project_prepare = project_commands.add_parser("prepare", help="准备 AI 任务书和完整候选，不调用模型")
+    project_prepare.add_argument("--path", type=Path, default=argparse.SUPPRESS)
+    project_prepare.add_argument("--request", default="")
+    project_edit_command = project_commands.add_parser("edit", help="让当前项目执行模型起草完整规则，审查后替换")
+    project_edit_command.add_argument("--path", type=Path, default=argparse.SUPPRESS)
+    project_edit_command.add_argument("--request")
+    project_edit_command.add_argument("--yes", action="store_true", help="生成后直接应用，跳过交互确认")
+    project_apply = project_commands.add_parser("apply", help="审查并应用已有完整候选")
+    project_apply.add_argument("--draft", type=Path, required=True)
+    project_apply.add_argument("--yes", action="store_true", help="已审查并授权直接应用候选")
     args = parser.parse_args(argv)
     try:
         installation = Installation(args.codex_home, args.bin_dir)
@@ -1123,14 +1296,23 @@ def main(argv=None):
         if args.command in {"install", "update"}:
             output = installation.install(args.source, require_existing=args.command == "update")
         elif args.command == "project":
+            if args.project_command is None or args.project_command == "menu":
+                project_menu(installation, args.path)
+                return 0
             if args.project_command == "init":
                 output = installation.project_init(args.path, args.profile, args.model, args.effort)
             elif args.project_command == "sync":
                 output = installation.project_sync(args.path)
             elif args.project_command == "status":
                 output = installation.project_status(args.path)
-            else:
+            elif args.project_command == "disable":
                 output = installation.project_disable(args.path)
+            elif args.project_command == "prepare":
+                output = installation.project_prepare(args.path, request=args.request)
+            elif args.project_command == "edit":
+                output = installation.project_edit(args.path, request=args.request, yes=args.yes)
+            else:
+                output = installation.project_apply(args.draft, yes=args.yes)
         elif args.command == "configure":
             output = installation.configure(args.profile, args.model, args.effort, default=args.default)
         elif args.command == "mode":

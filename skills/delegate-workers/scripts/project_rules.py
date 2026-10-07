@@ -59,17 +59,49 @@ def _json_bytes(value):
 
 def _atomic_write(path, data, mode):
     path = Path(path)
-    descriptor, temporary = tempfile.mkstemp(prefix=".delegate-workers-project-", dir=str(path.parent))
-    try:
+    root = (path.parent.parent.parent if path.parent.parent.name == BACKUP_DIR
+            else path.parent)
+    temporary_root = _project_tmp(root)
+    with tempfile.TemporaryDirectory(prefix="delegate-workers-project-write-",
+                                     dir=str(temporary_root)) as directory:
+        descriptor, temporary = tempfile.mkstemp(prefix=path.name + "-", dir=directory)
         with os.fdopen(descriptor, "wb") as stream:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, mode)
         os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+
+
+def _project_tmp(root):
+    """Return a project's own staging directory without following a redirect."""
+    path = Path(root) / "tmp"
+    if path.is_symlink() or (path.exists() and not path.is_dir()):
+        raise ProjectError(f"项目临时目录不是安全的普通目录：{path}")
+    try:
+        path.mkdir(mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise ProjectError(f"无法创建项目临时目录：{path}：{exc}") from exc
+    if path.is_symlink() or path.resolve() != path:
+        raise ProjectError(f"项目临时目录发生重定向，未进行修改：{path}")
+    return path
+
+
+def _validate_custom_rule(value):
+    try:
+        size = len(value.encode("utf-8")) if isinstance(value, str) else 0
+    except UnicodeEncodeError as exc:
+        raise ProjectError("项目状态 custom_rule 不是有效的 UTF-8 文本") from exc
+    if not isinstance(value, str) or not value.strip() or size > 128 * 1024:
+        raise ProjectError("项目状态 custom_rule 必须是有界的非空 UTF-8 文本")
+    if BEGIN_TOKEN.decode() in value or END_TOKEN.decode() in value:
+        raise ProjectError("项目状态 custom_rule 不得包含外层委派标记")
+    lines = value.splitlines()
+    for name, token in (("model", "{model}"), ("reasoning effort", "{reasoning_effort}")):
+        matches = [line for line in lines if line.startswith(f"- {name}:")]
+        if matches != [f"- {name}: `{token}`"]:
+            raise ProjectError(f"项目状态 custom_rule 的 {name} 占位行无效")
+    return value
 
 
 def _validate_profile(value):
@@ -84,7 +116,7 @@ def validate_state(value, *, validate_worker=False):
         raise ProjectError("项目状态必须是 JSON 对象")
     expected = {"schema_version", "enabled", "file", "sha256", "created_file",
                 "selection", "worker"}
-    unknown = set(value) - expected
+    unknown = set(value) - expected - {"custom_rule"}
     missing = expected - set(value)
     if missing or unknown:
         detail = []
@@ -103,6 +135,8 @@ def validate_state(value, *, validate_worker=False):
         raise ProjectError("项目状态中的指令块校验值无效")
     if type(value["created_file"]) is not bool:
         raise ProjectError("项目状态 created_file 必须是布尔值")
+    if "custom_rule" in value:
+        _validate_custom_rule(value["custom_rule"])
     selection = value["selection"]
     if not isinstance(selection, dict) or set(selection) != {"profile"}:
         raise ProjectError("项目状态 selection 格式无效")
@@ -463,11 +497,14 @@ def _apply(root, edits, operation):
     return backup
 
 
-def _state_value(file_name, block, created_file, profile, worker, enabled=True):
-    return {"schema_version": 1, "enabled": enabled, "file": file_name,
+def _state_value(file_name, block, created_file, profile, worker, enabled=True, custom_rule=None):
+    value = {"schema_version": 1, "enabled": enabled, "file": file_name,
             "sha256": hashlib.sha256(block).hexdigest(), "created_file": created_file,
             "selection": {"profile": profile},
             "worker": {"model": worker["model"], "reasoning_effort": worker["reasoning_effort"]}}
+    if custom_rule is not None:
+        value["custom_rule"] = _validate_custom_rule(custom_rule)
+    return value
 
 
 def _state_edit(root, before, value):
@@ -560,7 +597,9 @@ def init_project(path, *, template_path, profile=None, worker=None, default_sele
                 raise ProjectError("尚未提供项目执行模型选择")
         contents = _read_instructions(root)
         infos = _validate_markers_for_mutation(state, contents)
-        template = _load_template(template_path)
+        custom_rule = state.get("custom_rule") if state is not None else None
+        template = (custom_rule.encode("utf-8") if custom_rule is not None
+                    else _load_template(template_path))
         old_name = state["file"] if state is not None and state["enabled"] else None
         old_info = infos.get(old_name) if old_name else None
         target_name = _effective_name(contents)
@@ -583,7 +622,8 @@ def init_project(path, *, template_path, profile=None, worker=None, default_sele
         created_file = (state["created_file"] if state is not None and old_name == target_name
                         else target_before is None)
         edits.append(_instruction_edit(root, target_name, target_before, target_after))
-        new_state = _state_value(target_name, block, created_file, profile, worker, enabled=True)
+        new_state = _state_value(target_name, block, created_file, profile, worker, enabled=True,
+                                 custom_rule=custom_rule)
         edits.append(_state_edit(root, state_bytes, new_state))
         backup = _apply(root, edits, "init")
     return {"project": "init", "result": "initialized" if state is None else
@@ -610,7 +650,9 @@ def sync_project(path, *, template_path):
         worker, compatibility = _validated_worker(state["worker"])
         contents = _read_instructions(root)
         infos = _validate_markers_for_mutation(state, contents)
-        template = _load_template(template_path)
+        custom_rule = state.get("custom_rule")
+        template = (custom_rule.encode("utf-8") if custom_rule is not None
+                    else _load_template(template_path))
         old_name = state["file"]
         old_info = infos[old_name]
         target_name = _effective_name(contents)
@@ -629,7 +671,7 @@ def sync_project(path, *, template_path):
             target_after = old_before[:old_info["start"]] + block + old_before[old_info["end"]:]
         created_file = target_before is None if target_name != old_name else state["created_file"]
         new_state = _state_value(target_name, block, created_file, state["selection"]["profile"],
-                                 worker, enabled=True)
+                                 worker, enabled=True, custom_rule=custom_rule)
         edits.append(_instruction_edit(root, target_name, target_before, target_after))
         edits.append(_state_edit(root, state_bytes, new_state))
         backup = _apply(root, edits, "sync")

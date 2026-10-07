@@ -1,6 +1,6 @@
 ---
 name: delegate-workers
-description: Use configured model and reasoning presets with compatibility preflight when delegating execution work in Codex. The main agent retains planning and acceptance.
+description: Delegate scoped information collection and task-brief execution in Codex using configured worker model and reasoning presets with compatibility preflight. The main agent retains planning and acceptance.
 ---
 
 # Delegate Workers
@@ -11,6 +11,21 @@ and it does not force delegation.
 
 Keep the main agent's own model and reasoning effort unchanged; never copy worker
 settings into the main session.
+
+## 从信息采集到任务书与验收
+
+派发前读取 [任务书流程与示例](references/task-brief.md)。主代理先列清信息缺口，
+需要时下发范围明确的只读采集小节，汇总核实事实后决定方案和共享接口；信息
+已足够时不重复调查。默认把较大工作拆成单一目标、可独立验证的明确小节，
+共享契约已确定、无待交付依赖且写入范围不重叠的才并行；已经明确的单一小
+任务不机械再拆。不同文件仍可能共享契约，契约变化需重评受影响小节。
+
+任务书说明做什么、怎么做、动哪些文件/函数、保留什么行为和如何验证，可直接
+放在派发消息里。执行者只做该小节所需的定位、实现和自测，不重做整体规划、
+额外发散或自行递归派发；发现方案不合理或事实冲突时带证据上报并暂停受影响
+部分，只继续已明确不受影响的授权独立小节。主代理实际审查改动、验证结果
+和相关整体调用/配置链，再接受或退回明确修正任务。这是指导
+和提示约束，不是硬 ACL 或自动调度，也不改变模型选择和思考强度。
 
 ## 临时文件规范
 
@@ -67,8 +82,8 @@ warning goes to stderr, not into the TOML fragment on stdout.
 
 When a user has explicitly opted a project into the project rule, read the
 skill-local [project delegation template/context](references/project-delegation.md)
-to understand the generated managed rule; do not assume it documents commands
-unless it says so. Keep this opt-in project-scoped: use
+to understand the generated managed rule and its guidance for user-requested
+edits. Keep this opt-in project-scoped: use
 `dw project status` as a read-only diagnostic and suggest or run `dw project
 sync` only when an authorized explicit update is relevant. Do not scan every
 task, continuously regenerate files, implicitly opt in, or modify unrelated
@@ -76,14 +91,15 @@ projects. `dw project disable` is separate from global `dw mode` and
 `dw uninstall`.
 
 The project state file `.delegate-workers-project.json` carries the worker
-snapshot and ownership metadata; keep it with the generated `AGENTS.md` when
+snapshot, ownership metadata, and an optional internal `custom_rule` snapshot
+after reviewed AI editing; keep it with the generated `AGENTS.md` when
 sharing that project lifecycle. The root `.delegate-workers-project.lock` is a
 stable persistent operation lock, and
 `.delegate-workers-project-backups/<timestamp-id>/` contains a manifest and
 preimages for recovery. Treat the lock and backup directory as local artifacts
 to ignore according to the repository's policy; do not modify `.gitignore`
-automatically. The generated reference is template/context only, not a command
-or lifecycle guide.
+automatically. The reference is the generated rule template and context; use
+the actual CLI help for complete lifecycle command parameters.
 
 The project rule records the user's requested division—main-agent planning and
 review, execution work through the selected worker with explicit model/effort
@@ -92,6 +108,46 @@ presence as a check result; session loading, actual dispatch, and runtime
 worker identity remain unverified or unknown unless independently evidenced. If
 the requested execution model or effort is unavailable, report that and ask for
 an alternative; never silently fallback or claim execution without evidence.
+
+### User-requested project rule editing
+
+When the user asks to change project conventions, edit the complete active
+instruction document, including background, commands, file boundaries, and
+acceptance criteria as needed. Keep unrelated rules through semantic review.
+Project settings are editable repeatedly: `dw project` opens the Chinese menu
+(also available as global menu item 8), and explicit worker reconfiguration uses
+`dw project init` parameters. `prepare` / `edit` require an initialized, enabled
+project; non-Git directories need an explicit `--path`.
+
+For the main-agent/native-worker route, run `dw project prepare --path .`, read
+the returned prompt and candidate, and give a scoped task brief with only the
+candidate's absolute path writable. The worker must not rewrite the active
+`AGENTS.md`, `AGENTS.override.md`, or project state. Review the full candidate and
+diff using the installed `scripts/project_edit.py` API
+`preview_edit(draft_dir)`, then call
+`apply_edit(draft_dir, candidate_sha256=reviewed_hash)` with the exact returned
+hash you reviewed. Do not recalculate a changed candidate's hash to bypass that
+check. This route uses native dispatch when available and needs no MCP or
+independent CLI generation.
+
+`dw project edit --path . --request "..."` instead uses the existing local CLI
+worker with the explicit project snapshot; it does not change the main model,
+provider, or authentication. It shows the diff and asks before applying in a
+terminal; noninteractive use leaves a draft. `dw project apply --draft PATH`
+previews and applies that draft after confirmation. Noninteractive apply without
+`--yes` only previews; `--yes` expresses existing approval for this application,
+not a persistent preference or a required new approval gate.
+
+The candidate must keep the unique managed markers and current model/effort
+declarations. Change worker settings through the project configuration entry,
+not rule prose. Apply maintains the state hash and internal rule snapshot in
+one backed-up transaction. Later sync, worker reconfiguration, and
+disable/re-enable preserve that snapshot instead of reverting to the release
+template. Ordinary manual-drift protection remains; explicitly preparing a
+valid hand-edited block allows reviewed re-adoption. A baseline or candidate
+change invalidates the draft rather than authorizing an overwrite. Generation,
+structural checks, semantic review, and applying are separate results; do not
+claim newly written instructions are already loaded by the current session.
 
 ## Delegation contract
 
@@ -102,12 +158,15 @@ the requested choice is unavailable, say so accurately and ask which alternative
 the user wants. When the user gives no additional constraint, retain the main
 agent's general autonomy to choose whether and how to delegate.
 
-The main agent owns planning, architecture, review, and final acceptance. An
-execution agent works directly within the stated scope; delegation is not a
-reason to recurse mechanically into more agents. Pass only the necessary
-objective, file-write boundary, interface context, and acceptance criteria, not
-the entire conversation history. A successful dispatch and a worker's completed
-turn are distinct from the main agent's review and acceptance.
+The main agent owns planning, architecture, review, and final acceptance. Use the
+task-brief workflow above for information collection and bounded execution.
+Pass the brief and necessary verified context, not the entire conversation
+history. Workers keep the local judgment needed to complete their assigned
+section and may raise evidence-backed objections; they do not take over overall
+planning, expand scope, or delegate again unless the main agent explicitly
+authorizes further division of that section. The main agent reviews the real
+diff, test results, shared contracts, relevant integration paths, and overall
+goal. Dispatch, worker self-test, and main-agent acceptance are separate states.
 
 When the host supports it, pass the requested worker `model` and
 `reasoning_effort` explicitly and use the actual tool schema. A preset is a

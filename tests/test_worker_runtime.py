@@ -557,9 +557,52 @@ class OutcomeTests(RuntimeCase):
         self.assertIn(final["artifacts"]["job_dir"], prompt)
         self.assertIn("scripts/a b.py", prompt)
         self.assertIn("不是文件系统权限 ACL", prompt)
-        self.assertIn("不要机械地继续委派子代理", prompt)
         self.assertEqual(final["requested"]["writable_files"], ["scripts/a b.py", "文档/说明.md"])
         self.assertEqual(final["sandbox"], "workspace-write")
+
+    def test_task_briefs_and_plain_text_preserve_transport_and_dispatch_parameters(self):
+        runtime = self.runtime()
+        cases = (
+            ("collection", "小节 1：只读信息采集\n目标：定位 scripts/a.py 的输入校验。\n"
+             "读取边界：scripts/a.py 的 validate()，不得修改。\n"
+             "步骤：核对入口与错误路径，返回文件位置、事实、覆盖情况和未知项；不实现。\n"
+             "独立任务：无需其他小节结果。验收：每条结论有出处；矛盾带证据上报。",
+             {}, "read-only", []),
+            ("execution", "小节 2：执行输入校验修正\n已核实：scripts/a.py validate() 接收空字符串。\n"
+             "目标：仅拒绝空字符串，保留其余输入行为和公共函数签名。\n"
+             "写入：scripts/a.py；步骤：在 validate() 增加空字符串检查，运行 python -m unittest。\n"
+             "依赖：小节 1 已由主代理审查；可与文档小节并行，禁止修改文档。\n"
+             "验收：既有合法输入测试通过；异议或越界先上报；回报改动、自测和未验证项。",
+             {"sandbox": "workspace-write", "writable_files": ["scripts/a.py"]},
+             "workspace-write", ["scripts/a.py"]),
+            ("plain", "Reply READY.", {}, "read-only", []),
+        )
+        for name, task, options, sandbox, writable_files in cases:
+            with self.subTest(case=name):
+                copy_path = self.root / (name + "-prompt.txt")
+                argv_path = self.root / (name + "-argv.json")
+                state = self.spawn(runtime, task=task, model="vendor/brief-worker", effort="max",
+                                   env={"FAKE_CODEX_PROMPT_COPY": str(copy_path),
+                                        "FAKE_CODEX_ARGV_COPY": str(argv_path)}, **options)
+                final = self.wait_terminal(runtime, state["agent_id"])
+                self.assertEqual(final["status"], "completed")
+                prompt = Path(final["artifacts"]["prompt"]).read_text(encoding="utf-8")
+                self.assertTrue(prompt.endswith("--- 任务 ---\n" + task))
+                self.assertEqual(copy_path.read_text(encoding="utf-8"), prompt)
+                self.assertEqual(final["requested"]["task"], task)
+                self.assertEqual(final["requested"]["model"], "vendor/brief-worker")
+                self.assertEqual(final["requested"]["reasoning_effort"], "max")
+                self.assertEqual(final["requested"]["sandbox"], sandbox)
+                self.assertEqual(final["requested"]["writable_files"], writable_files)
+                self.assertEqual(final["resolved"]["model"], "vendor/brief-worker")
+                self.assertEqual(final["resolved"]["reasoning_effort"], "max")
+                argv = json.loads(argv_path.read_text(encoding="utf-8"))
+                self.assertEqual(argv[argv.index("--model") + 1], "vendor/brief-worker")
+                self.assertIn('model_reasoning_effort="max"', argv)
+                self.assertEqual(argv[argv.index("--sandbox") + 1], sandbox)
+                request = json.loads(Path(final["artifacts"]["request"]).read_text(encoding="utf-8"))
+                self.assertEqual(request["writable_files"], writable_files)
+                self.assertEqual(request["sandbox"], sandbox)
 
     def test_nonzero_exit_reports_failure_with_sanitized_hint(self):
         runtime = self.runtime()

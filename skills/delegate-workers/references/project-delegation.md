@@ -14,7 +14,7 @@ worker works only within the user's approved boundary and reports:
 - the explicit model and reasoning-effort parameters requested;
 - changed files;
 - tests and concrete evidence; and
-- unverified items.
+- objections and unverified items.
 
 The requested pair is a request, not proof of runtime identity. Never claim
 that the requested model or effort was independently verified unless the host
@@ -25,6 +25,53 @@ higher-priority instructions.
 Read the installed `delegate-workers` skill and its current configuration when
 the task requires its guidance. Do not install, update, activate, or change
 global settings while handling an ordinary project task.
+
+### 信息采集、分节任务书与主代理审查
+
+主代理先列清信息缺口，需要时派只读采集 worker，限定问题和读取范围，只返回
+事实、来源/文件位置、覆盖情况和未知项，不顺带实现。已有足够可靠的信息时
+不重复调查。主代理汇总核实后决定整体方案和共享契约，按实际需要明确本任务
+相关的字段、类型、单位、默认值和错误语义，不把缺失设计留给执行者猜测。
+默认把较大工作拆成单一目标、可独立验证的小节；单一明确小任务不机械再拆。
+契约已确定、无待交付依赖且写入范围不重叠的小节可并行；存在模块调用关系但
+双方不等待对方实现时也可并行。有依赖的等待前置结果通过主代理审查；不同
+文件不等于契约独立，契约变化要重评受影响小节。
+
+每小节的任务书写清角色、目标与完成条件、已核实信息及来源、具体文件/函数
+和读写边界、修改步骤及需保留的行为、依赖与并发边界、验证命令和预期、回报
+及异常处理。可直接在派发消息中写，不强制任务文件、固定 JSON、字段校验、
+并发数或新增配置。验证命令及预期由主代理按真实工具确认，未核实的标为待
+确认，不编造已运行的检查或保证成功。该流程是指导和提示约束，不是硬 ACL
+或自动调度，不改变所选模型或思考强度。
+
+worker 只做任务书必要的定位、实现和自测，不重做全局规划，不额外调查、
+重构或加功能，不自行递归派发；主代理明确授权该小节继续分工时除外。保留
+必要局部判断，也允许反驳：遇到事实冲突、不合理方案、缺失信息、接口冲突或
+越界需求，带证据、影响和最小建议上报，暂停受影响部分；只继续已明确不受
+影响的授权独立小节，不擅改共享契约或扩大范围。回报完成情况、改动/事实出处、验证及结果、
+异议和未验证项。
+
+主代理审查真实 diff 和相关测试，核对任务边界、共享契约、整体目标及相关
+整体调用/配置链或适用集成路径，再接受或退回具体修正小节，写明问题位置、
+预期修正和复验方式；worker 自测通过
+不等于主代理验收通过。
+
+### 用户要求修改项目约定时
+
+项目约定可以反复修改，内容包含背景、运行/测试命令、文件范围、任务书和验收
+方式。只有用户要求修改这些约定时才进入编辑流程；普通执行任务不自行重写
+项目规则。可用 `dw project` 项目菜单，也可 `dw project prepare --path .` 准备
+完整活动文档的候选，让原生 worker 按明确任务书只写返回的候选绝对路径。
+worker 不直接写活动指令或项目状态；主代理读取候选全文和完整 diff，做语义
+审查，再由编辑工具以已审查的候选摘要备份、替换并维护校验记录。这条起草
+路径不要求 MCP。候选生成、结构检查、主代理审查和应用成功分别报告。
+
+保留唯一的项目委派标记及本规则记录的模型/强度声明，执行配置从项目设置
+入口改，不通过编辑正文切换。应用后工具保存内部 AI 规则快照，后续同步、
+修改 worker 和停用后重新启用会保留它；手工修改合法规则块时可明确进入编辑
+流程，审查后重新纳管，不能用普通同步直接覆盖。草稿与事务暂存放项目 `tmp/`；
+候选或项目基线变化时重新准备，不覆盖后来改动。文件更新不代表当前会话已
+加载新指令。
 
 ### 已启用的统一接口
 
